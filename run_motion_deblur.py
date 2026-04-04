@@ -182,7 +182,7 @@ def main():
         vspipe_proc = subprocess.Popen([
             "vspipe", "-c", "y4m", "-p",
             VPY_SCRIPT, fifo_path,
-            "-r", str(args.requests),
+            "-r", str(args.cframes),
         ], env=env)
 
         vspipe_proc.wait()
