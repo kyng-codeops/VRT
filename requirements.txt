@@ -11,6 +11,7 @@ torch>=1.9
 torchvision
 timm
 einops
+av
 vsrvrt>=1.0.0,<=1.1.3  # Cache eviction patch required; see patches/ and apply_patches.py
 # vapoursynth: install via conda (pip has unresolvable dependency conflicts
 # between vsstubs 1.2.0 and vapoursynth 74rc1). Use: conda install vapoursynth

@@ -1,11 +1,17 @@
 import vapoursynth as vs
+import os
 from vsrvrt import Deblur
 
 core = vs.core
 core.max_cache_size = 2048  # Limit VS frame cache to 2GB RAM
 
+# Get input file from environment (set by run_motion_deblur.py)
+input_file = os.environ.get("VRT_INPUT")
+if not input_file:
+    raise vs.Error("VRT_INPUT environment variable not set. Use run_motion_deblur.py to run this script.")
+
 # Load your source
-clip = core.ffms2.Source("blurry_video.mp4")
+clip = core.ffms2.Source(input_file)
 
 # Convert to RGB for Deblur (BT.601 for SD/DVD content)
 clip = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s="470bg")
