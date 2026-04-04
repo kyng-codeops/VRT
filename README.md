@@ -19,8 +19,12 @@ Computer Vision Lab, ETH Zurich & Meta Inc.
 ![visitors](https://visitor-badge.glitch.me/badge?page_id=jingyunliang/VRT)
 [ <a href="https://colab.research.google.com/gist/JingyunLiang/deb335792768ad9eb73854a8efca4fe0#file-vrt-demo-on-video-restoration-ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="google colab logo"></a>](https://colab.research.google.com/gist/JingyunLiang/deb335792768ad9eb73854a8efca4fe0#file-vrt-demo-on-video-restoration-ipynb)
 
-This repository is the official PyTorch implementation of "VRT: A Video Restoration Transformer"
-([arxiv](https://arxiv.org/pdf/2201.12288.pdf), [supp](https://github.com/JingyunLiang/VRT/releases/download/v0.0/VRT_supplementary.pdf), [pretrained models](https://github.com/JingyunLiang/VRT/releases), [visual results](https://github.com/JingyunLiang/VRT/releases)). VRT achieves state-of-the-art performance in
+VRT is VapourSynth plugin and stands for "Video Restoration Transformer".
+I forked a copy to add my user notes and any customizations. For now the repo is as is other than some notes and maybe vapoursynth script examples.
+
+
+This repository is my forked PyTorch copy of "VRT: A Video Restoration Transformer"
+(original work from [arxiv](https://arxiv.org/pdf/2201.12288.pdf), [supp](https://github.com/JingyunLiang/VRT/releases/download/v0.0/VRT_supplementary.pdf), [pretrained models](https://github.com/JingyunLiang/VRT/releases), [visual results](https://github.com/JingyunLiang/VRT/releases)). VRT achieves state-of-the-art performance in
 - video SR (REDS, Vimeo90K, Vid4, UDM10) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; :heart_eyes: **+ 0.33~0.51dB** :heart_eyes:
 - video deblurring (GoPro, DVD, REDS) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; :heart_eyes: &nbsp;&nbsp;&nbsp; **+ 1.47~2.15dB** &nbsp;&nbsp;&nbsp; :heart_eyes: 
 - video denoising (DAVIS, Set8)   &nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; :heart_eyes: &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; **+ 1.56~2.16dB** &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; :heart_eyes:
@@ -72,6 +76,7 @@ This repository is the official PyTorch implementation of "VRT: A Video Restorat
 1. [Quick Testing](#Quick-Testing)
 1. [Training](#Training)
 1. [Results](#Results)
+1. [Basic Usage](#basic-usage)
 1. [Citation](#Citation)
 1. [License and Acknowledgement](#License-and-Acknowledgement)
 
@@ -187,6 +192,116 @@ Space-Time Video Super-Resolution
   <img width="350" src="assets/stvsr.jpeg">
 </p>
 
+
+
+## Local Modifications to vsrvrt
+
+### Preview Mode Chunk Cache Eviction
+
+**Affects**: vsrvrt 1.0.0 through 1.1.3 (latest as of April 2026). Bug is present in all released versions.
+
+The `preview_mode=True` path in `vsrvrt` (`rvrt_filter.py :: _create_filter_wrapper_preview`) processes chunks lazily on-demand, which is essential for long videos piped through vspipe/ffmpeg. However, the chunk cache (`chunk_cache` dict) grows without bound — every processed chunk is kept in CPU RAM indefinitely. For an 83,760-frame video at chunk_size=64, this eventually accumulates ~500 GB of tensors and triggers the OOM killer.
+
+**Fix**: Added cache eviction after storing each new chunk, keeping at most 3 chunks in memory. Since vspipe requests frames sequentially, only the current chunk is ever needed; the extra 2 slots provide a safety margin.
+
+```python
+# In _create_filter_wrapper_preview, after "chunk_cache[chunk_idx] = output_chunk.cpu()":
+max_cached = 3
+if len(chunk_cache) > max_cached:
+    oldest = min(k for k in chunk_cache if k != chunk_idx)
+    del chunk_cache[oldest]
+```
+
+**File modified**: `~/.conda/envs/vsynth/lib/python3.12/site-packages/vsrvrt/rvrt_filter.py`
+
+> **Note**: The default (non-preview) chunked mode (`_create_filter_wrapper_chunked`) has the same problem — it eagerly processes all chunks before returning any frames. Always use `preview_mode=True` for long videos piped to ffmpeg.
+
+### Applying Patches
+
+Patch files are stored in `patches/` and can be applied (or re-applied after a `pip upgrade`) with:
+
+```bash
+python apply_patches.py          # apply all pending patches
+python apply_patches.py --check  # dry-run, report status only
+```
+
+The script detects the vsrvrt install location automatically, skips already-applied patches, and reports conflicts if the upstream code has changed.
+
+## Basic Usage 
+
+### In a .vpy Script
+Once installed, you can call the restoration functions directly in your script. Note that VRT is highly resource-intensive; using FP16 mode is recommended to reduce VRAM usage by 50%
+
+```
+import vapoursynth as vs
+from vsrvrt import rvrt
+
+core = vs.core
+clip = core.ffms2.Source("input.mkv")
+
+# Example: Video Denoising
+# sigma=3.0 is a typical starting point; fp16=True saves VRAM
+processed = rvrt(clip, sigma=3.0, fp16=True)
+
+processed.set_output()
+```
+
+Performance Optimization
+
+  - Preview Mode: Set preview_mode=True when using tools like vspreview for faster feedback.
+  - Memory Management: If you encounter Out of Memory (OOM) errors, decrease the tile_size or chunk_size in the function arguments.
+  - Precision: Use fp16=True for a roughly 2x speedup on compatible hardware
+
+How to Use the Weights
+
+The plugin uses these weights by loading them into the RVRT neural network architecture during script execution. Depending on the specific implementation (like vs-rvrt), they are handled in one of two ways:
+
+  - Auto-Download (Recommended): Most modern VapourSynth PyTorch wrappers (like vs-rvrt or vs-basicvsrpp) will automatically download the required .pth files to a cache directory the first time you run a specific model.
+  - Manual Placement: If you are using a custom model or offline machine, you typically move the .pth files into a specific models or weights folder within your Conda environment's site-packages.
+    - Typical Linux Path: ~/.conda/envs/vsynth/lib/python3.12/site-packages/vsrvrt/models/
+
+Model Categories
+You must choose the correct .pth model based on your video's task and source content:
+
+|   Task          | 	Dataset / Model   |  	Best For    |
+|-----------------|---------------------|---------------|
+|Super-Resolution	|REDS	                |Natural, diverse scenes (720p sources)|
+|Super-Resolution	|Vimeo-90K	          |Web content and lower-resolution videos|
+|Deblurring	      |GoPro	              |Camera shake and dynamic motion blur|
+|Denoising	      |DAVIS	              |High-quality footage with tunable noise levels|
+
+In your .vpy script, you don't usually point to the file path directly. Instead, you select the model name, and the plugin resolves the path to the corresponding .pth file:
+
+```
+from vsrvrt import rvrt
+# The plugin automatically finds the 'REDS' .pth weights in its internal models folder
+clip = rvrt(clip, modelname="REDS", scale=4)
+```
+
+VapourSynth Core Cache Limit
+While the model handles its own VRAM, you should limit the VapourSynth CPU cache to prevent it from holding too many uncompressed frames in your system RAM:
+
+```
+import vapoursynth as vs
+from vsrvrt import rvrt
+
+core = vs.core
+# Limit cache to 4000 MB (4GB) to keep the system responsive
+core.max_cache_size = 4000 
+
+clip = core.ffms2.Source("input.mkv")
+
+# Optimized for a GPU with ~8GB-12GB VRAM
+clip = rvrt(clip, 
+            modelname="REDS", 
+            num_frames=12,    # Process 12 frames at a time temporally
+            tile_x=512,       # Split frames into 512px wide tiles
+            tile_y=512,       # Split frames into 512px high tiles
+            tile_pad=32,      # Avoid seams between tiles
+            fp16=True)        # Use half-precision to save 50% VRAM
+
+clip.set_output()
+```
 
 
 
