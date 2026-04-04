@@ -26,10 +26,18 @@ factor = int(os.environ.get("VRT_FACTOR", "2"))
 #   - "4.25.lite" for faster processing (slightly lower quality)
 #   - "4.26.heavy" for latest heavy model
 # ensemble: True for smoother results in uncertain areas (slower)
-# sc: True to detect scene changes and avoid interpolating across cuts
+#     Not supported by all models (e.g. v4.25 does not support it).
+# sc: scene change detection — requires the VapourSynth MiscFilters plugin
+#     (misc.SCDetect). Set to False if MiscFilters is not installed.
 # scale: optical flow resolution — use 0.5 for 4K, 1.0 for HD/SD
+try:
+    core.misc  # check if MiscFilters plugin is available
+    sc_enabled = True
+except AttributeError:
+    sc_enabled = False
+
 interpolated = rife(clip, model="4.25", factor_num=factor, factor_den=1,
-                    ensemble=True, sc=True, sc_threshold=0.15,
+                    ensemble=False, sc=sc_enabled, sc_threshold=0.15,
                     scale=1.0, auto_download=True)
 
 # To use RGBH (FP16) for faster inference with slightly lower precision:
