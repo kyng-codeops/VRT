@@ -114,8 +114,8 @@ def main():
     args = parse_args()
 
     script_dir = Path(__file__).resolve().parent
-    os.chdir(script_dir)
 
+    # Resolve paths before chdir so they're relative to the user's CWD
     input_path = str(Path(args.input).resolve())
     if not Path(input_path).is_file():
         sys.exit(f"ERROR: input file not found: {input_path}")
@@ -125,6 +125,9 @@ def main():
     else:
         stem = Path(input_path).stem
         output_path = str(script_dir / f"{stem}_interpolated.mkv")
+
+    # chdir to script dir so vspipe can find the .vpy
+    os.chdir(script_dir)
 
     # Detect framerate and compute output rate
     fps_num, fps_den = get_framerate(input_path)
