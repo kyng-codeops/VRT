@@ -7,11 +7,11 @@ core = vs.core
 core.max_cache_size = 4096  # 4GB — field analysis can be memory-hungry
 
 # ---------------------------------------------------------------------------
-# Environment variables (set by run_detelecine.py)
+# Environment variables (set by run_deti2p.py)
 # ---------------------------------------------------------------------------
 input_file = os.environ.get("VRT_INPUT")
 if not input_file:
-    raise vs.Error("VRT_INPUT environment variable not set. Use run_detelecine.py to run this script.")
+    raise vs.Error("VRT_INPUT environment variable not set. Use run_deti2p.py to run this script.")
 
 mode = os.environ.get("VRT_MODE", "auto")          # auto | ivtc | deinterlace
 field_order = os.environ.get("VRT_FIELD_ORDER", "auto")  # auto | tff | bff

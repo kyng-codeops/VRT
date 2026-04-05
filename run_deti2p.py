@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Run detelecine / deinterlace pipeline: vspipe → FIFO → ffmpeg.
+"""Run de-TI2P (detelecine / deinterlace to progressive) pipeline: vspipe → FIFO → ffmpeg.
 
 Auto-detects telecine vs interlace and field order (TFF/BFF), then applies
 the correct processing. Optionally upscales with RVRT VSR (4x) or a custom
 Real-ESRGAN .pth model.
 
 Usage:
-    python run_detelecine.py -i input.mkv                        # auto-detect, FFV1 lossless
-    python run_detelecine.py -i input.mkv --analyze              # analyze only, no output
-    python run_detelecine.py -i input.mkv --mode ivtc             # force inverse telecine
-    python run_detelecine.py -i input.mkv --mode deinterlace      # force deinterlace
-    python run_detelecine.py -i input.mkv --field-order bff       # force bottom-field-first
-    python run_detelecine.py -i input.mkv --upscale vsr           # 4x RVRT super-resolution
-    python run_detelecine.py -i input.mkv --upscale esrgan --esrgan-model weights.pth
-    python run_detelecine.py -i input.mkv --gpu --encoder hevc_nvenc --cq 18
+    python run_deti2p.py -i input.mkv                        # auto-detect, FFV1 lossless
+    python run_deti2p.py -i input.mkv --analyze              # analyze only, no output
+    python run_deti2p.py -i input.mkv --mode ivtc             # force inverse telecine
+    python run_deti2p.py -i input.mkv --mode deinterlace      # force deinterlace
+    python run_deti2p.py -i input.mkv --field-order bff       # force bottom-field-first
+    python run_deti2p.py -i input.mkv --upscale vsr           # 4x RVRT super-resolution
+    python run_deti2p.py -i input.mkv --upscale esrgan --esrgan-model weights.pth
+    python run_deti2p.py -i input.mkv --gpu --encoder hevc_nvenc --cq 18
 """
 
 import argparse
@@ -27,9 +27,11 @@ from pathlib import Path
 
 import av
 
+from detect_tip import quick_detect
+
 os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9"
 
-VPY_SCRIPT = "detelecine.vpy"
+VPY_SCRIPT = "deti2p.vpy"
 
 
 def get_framerate(input_path: str) -> tuple[int, int]:
@@ -147,7 +149,7 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Detelecine / deinterlace pipeline: vspipe → ffmpeg",
+        description="De-TI2P (detelecine / deinterlace to progressive) pipeline: vspipe → ffmpeg",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("-i", "--input", required=True, help="Input video file")
@@ -177,7 +179,7 @@ def parse_args():
     up_group = parser.add_argument_group("upscaling")
     up_group.add_argument("--upscale", default="none",
                           choices=["none", "vsr", "esrgan"],
-                          help="Upscale method after detelecine/deinterlace.\n"
+                          help="Upscale method after de-TI2P processing.\n"
                           "  none:   no upscaling\n"
                           "  vsr:    RVRT video super-resolution (4x, GPU)\n"
                           "  esrgan: Real-ESRGAN with custom .pth weights (GPU)")
@@ -231,6 +233,9 @@ def main():
 
     # Build environment for .vpy
     env = os.environ.copy()
+    # Ensure our conda env's bin is first in PATH so vspipe finds the right libs
+    conda_bin = str(Path(sys.executable).parent)
+    env["PATH"] = conda_bin + os.pathsep + env.get("PATH", "")
     env["VRT_INPUT"] = input_path
     env["VRT_MODE"] = args.mode
     env["VRT_FIELD_ORDER"] = args.field_order
@@ -247,20 +252,36 @@ def main():
     print(f"Input:      {input_path}")
     print(f"Source:     {src_w}x{src_h} @ {src_fps_num}/{src_fps_den} ({src_fps:.4f} fps)")
 
-    # Run analysis phase
-    print("Analyzing field order and telecine pattern...")
-    analysis = run_analysis(input_path, env)
-    detected_mode = analysis.get("mode", "telecine")
-    detected_order = analysis.get("field_order", "tff")
-    field_type = analysis.get("field_type", "interlaced")
+    # --- Auto-detection via idet (when mode or field-order is auto) ---
+    if args.mode == "auto" or args.field_order == "auto":
+        print("Analyzing field structure (idet)...")
+        tip = quick_detect(input_path)
+        print(f"Detection:  {tip['detail']}")
+
+        if args.mode == "auto":
+            detected_mode = tip["mode"]
+        else:
+            detected_mode = {"ivtc": "telecine", "deinterlace": "interlaced"}[args.mode]
+
+        if args.field_order == "auto":
+            detected_order = tip["field_order"] if tip["field_order"] != "unknown" else "tff"
+        else:
+            detected_order = args.field_order
+    else:
+        detected_mode = {"ivtc": "telecine", "deinterlace": "interlaced"}[args.mode]
+        detected_order = args.field_order
+
+    # Set env so the .vpy skips its own auto-detect and uses these values
+    env["VRT_MODE"] = {"telecine": "ivtc", "interlaced": "deinterlace", "progressive": "auto"}[detected_mode]
+    env["VRT_FIELD_ORDER"] = detected_order
 
     mode_labels = {
-        "telecine": "Telecine (3:2 pulldown) → IVTC",
-        "interlaced": "True interlace → nnedi3 deinterlace",
+        "telecine": "Telecine (3:2 pulldown) \u2192 IVTC",
+        "interlaced": "True interlace \u2192 nnedi3 deinterlace",
         "progressive": "Progressive (no processing needed)",
     }
     print(f"Field order: {detected_order.upper()}")
-    print(f"Detection:   {mode_labels.get(detected_mode, detected_mode)}")
+    print(f"Mode:        {mode_labels.get(detected_mode, detected_mode)}")
 
     if args.analyze:
         print("\nAnalysis complete (--analyze mode, no output generated).")
@@ -296,18 +317,26 @@ def main():
     vspipe_proc = None
 
     def cleanup(signum=None, frame=None):
+        # Kill vspipe first (stop producing frames) then let ffmpeg finalize
         if vspipe_proc and vspipe_proc.poll() is None:
             print(f"\nKilling vspipe (pid {vspipe_proc.pid})...")
             vspipe_proc.kill()
-            vspipe_proc.wait()
+            try:
+                vspipe_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         if ffmpeg_proc and ffmpeg_proc.poll() is None:
             print(f"Stopping ffmpeg (pid {ffmpeg_proc.pid}), finalizing output...")
-            ffmpeg_proc.send_signal(signal.SIGINT)
             try:
-                ffmpeg_proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
+                ffmpeg_proc.send_signal(signal.SIGINT)
+                ffmpeg_proc.wait(timeout=10)
+            except (subprocess.TimeoutExpired, OSError):
+                print(f"Force-killing ffmpeg (pid {ffmpeg_proc.pid})...")
                 ffmpeg_proc.kill()
-                ffmpeg_proc.wait()
+                try:
+                    ffmpeg_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         try:
             os.unlink(fifo_path)
         except FileNotFoundError:
@@ -320,13 +349,15 @@ def main():
 
     try:
         ffmpeg_cmd = build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args)
-        ffmpeg_proc = subprocess.Popen(ffmpeg_cmd)
+        # start_new_session=True puts children in their own process group
+        # so terminal Ctrl+C only goes to Python, giving us full cleanup control
+        ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, start_new_session=True)
 
         vspipe_proc = subprocess.Popen([
             "vspipe", "-c", "y4m", "-p",
             VPY_SCRIPT, fifo_path,
             "-r", str(args.cframes),
-        ], env=env, stderr=subprocess.PIPE)
+        ], env=env, stderr=subprocess.PIPE, start_new_session=True)
 
         vspipe_proc.wait()
         vspipe_exit = vspipe_proc.returncode
@@ -334,7 +365,7 @@ def main():
         ffmpeg_proc.wait()
         ffmpeg_exit = ffmpeg_proc.returncode
 
-    except Exception:
+    except (Exception, SystemExit):
         cleanup()
         raise
 
