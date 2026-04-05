@@ -43,7 +43,10 @@ def detect_field_order(clip):
     prog_count = 0
 
     for i in range(0, clip.num_frames, max(1, clip.num_frames // sample_count)):
-        frame = clip.get_frame(i)
+        try:
+            frame = clip.get_frame(i)
+        except vs.Error:
+            continue
         fb = frame.props.get("_FieldBased", 0)
         if fb == 2:
             tff_count += 1
@@ -86,7 +89,10 @@ def detect_telecine(clip, order):
     combed_count = 0
     matched_count = 0
     for i in range(matched.num_frames):
-        frame = matched.get_frame(i)
+        try:
+            frame = matched.get_frame(i)
+        except vs.Error:
+            continue
         combed = frame.props.get("_Combed", 0)
         if combed:
             combed_count += 1
@@ -145,158 +151,158 @@ if analysis_path:
 # If analysis-only mode, output a single frame and exit
 if os.environ.get("VRT_ANALYZE_ONLY") == "1":
     core.std.Trim(clip, 0, 0).set_output()
-    raise SystemExit(0)
-
-# ---------------------------------------------------------------------------
-# 5. Process: IVTC or Deinterlace
-# ---------------------------------------------------------------------------
-if detected_mode == "telecine":
-    # Inverse telecine: VFM field matching → VDecimate to drop duplicates
-    # order: 0=BFF, 1=TFF
-    # mode=5: highest quality matching (2-way + 3rd match)
-    clip = core.vivtc.VFM(clip, order=ord_val, mode=5)
-    clip = core.vivtc.VDecimate(clip)
-    # Output: 23.976 fps progressive from 29.97 fps telecined source
-
-elif detected_mode == "interlaced":
-    # True deinterlace using nnedi3 (bob to double rate, then decimate)
-    # field: 0=same rate(keep bottom), 1=same rate(keep top),
-    #        2=double rate(start bottom), 3=double rate(start top)
-    # For same-rate deinterlace: use field=1 for TFF, field=0 for BFF
-    nnedi3_field = 1 if detected_order == "tff" else 0
-    clip = core.nnedi3.nnedi3(clip, field=nnedi3_field, qual=2, nsize=0, nns=3)
-
-# else: progressive — no processing needed
-
-# ---------------------------------------------------------------------------
-# 6. Optional upscale
-# ---------------------------------------------------------------------------
-if upscale_mode == "vsr":
-    # VapourSynth RVRT video super-resolution (4x)
-    from vsrvrt import SuperRes
-    # Convert to RGBS for RVRT
-    clip = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s="470bg")
-    clip = SuperRes(clip, model="reds", preview_mode=True,
-                    tile_size=(16, 0, 0), tile_overlap=(4, 0, 0),
-                    chunk_overlap=24)
-    # Back to YUV for output
-    clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s="470bg")
-
-elif upscale_mode == "esrgan":
-    # Real-ESRGAN single-image super-resolution via custom .pth weights
-    # This uses torch directly — load model, process frame-by-frame
-    import torch
-    import numpy as np
-
-    if not esrgan_model or not os.path.isfile(esrgan_model):
-        raise vs.Error(f"VRT_ESRGAN_MODEL not set or file not found: {esrgan_model}")
-
-    # Lazy-load the model on first frame
-    _esrgan_net = [None]
-    _esrgan_scale = [4]  # will be detected from model
-
-    def load_esrgan_model(model_path, device):
-        """Load a Real-ESRGAN .pth state dict and infer architecture."""
-        state_dict = torch.load(model_path, map_location=device, weights_only=False)
-        if "params_ema" in state_dict:
-            state_dict = state_dict["params_ema"]
-        elif "params" in state_dict:
-            state_dict = state_dict["params"]
-
-        # Detect RRDBNet architecture from state dict keys
-        # Standard RRDBNet: conv_first, body.{0..N}.rdb{1,2,3}, conv_body,
-        #   conv_up1, conv_up2, [conv_up3], conv_hr, conv_last
-        from models.network_rrdbnet import RRDBNet
-
-        # Infer num_block from body keys
-        body_keys = [k for k in state_dict if k.startswith("body.") and ".rdb" in k]
-        if body_keys:
-            block_nums = set(int(k.split(".")[1]) for k in body_keys)
-            num_block = max(block_nums) + 1
-        else:
-            num_block = 23  # default
-
-        # Infer scale from conv_up keys
-        up_keys = [k for k in state_dict if k.startswith("conv_up")]
-        scale = 2 ** len(up_keys) if up_keys else 4
-
-        # Infer in/out channels from first/last conv
-        in_nc = state_dict["conv_first.weight"].shape[1]
-        out_nc = state_dict["conv_last.weight"].shape[0]
-        num_feat = state_dict["conv_first.weight"].shape[0]
-
-        model = RRDBNet(in_nc, out_nc, num_feat=num_feat,
-                        num_block=num_block, num_grow_ch=32,
-                        scale=scale)
-        model.load_state_dict(state_dict, strict=True)
-        model.eval().to(device)
-        return model, scale
-
-    def esrgan_process(n, f):
-        """Frame-by-frame ESRGAN processing callback."""
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if _esrgan_net[0] is None:
-            _esrgan_net[0], _esrgan_scale[0] = load_esrgan_model(esrgan_model, device)
-
-        model = _esrgan_net[0]
-        scale = _esrgan_scale[0]
-
-        # Read RGBS frame to numpy → torch
-        planes = [np.asarray(f[0][p]) for p in range(f[0].format.num_planes)]
-        img = np.stack(planes, axis=0)  # [C, H, W] float32
-        tensor = torch.from_numpy(img).unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            output = model(tensor)
-
-        output = output.squeeze(0).clamp(0, 1).cpu().numpy()
-        h, w = output.shape[1], output.shape[2]
-
-        # Create output frame
-        out_frame = f[0].copy()
-        for p in range(3):
-            np.copyto(np.asarray(out_frame[p]), output[p])
-        return out_frame
-
-    # Convert to RGBS for ESRGAN
-    clip_rgb = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s="470bg")
-
-    # We need to create the output clip with the correct dimensions
-    # Use a blank clip at the target size as template
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    test_state = torch.load(esrgan_model, map_location="cpu", weights_only=False)
-    if "params_ema" in test_state:
-        test_state = test_state["params_ema"]
-    elif "params" in test_state:
-        test_state = test_state["params"]
-    up_keys = [k for k in test_state if k.startswith("conv_up")]
-    sr_scale = 2 ** len(up_keys) if up_keys else 4
-    del test_state
-
-    out_w = clip_rgb.width * sr_scale
-    out_h = clip_rgb.height * sr_scale
-
-    blank = core.std.BlankClip(clip_rgb, width=out_w, height=out_h)
-    clip = core.std.ModifyFrame(blank, clips=[clip_rgb], selector=esrgan_process)
-
-    # Back to YUV
-    clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s="470bg")
 
 else:
-    # No upscale — just ensure output is YUV444P10
-    if clip.format.id != vs.YUV444P10:
-        matrix = "470bg"  # BT.601 for SD content
-        if clip.width >= 1280 or clip.height >= 720:
-            matrix = "709"
-        if clip.format.color_family == vs.RGB:
-            clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s=matrix)
-        else:
-            clip = core.resize.Bicubic(clip, format=vs.YUV444P10)
+    # -----------------------------------------------------------------------
+    # 5. Process: IVTC or Deinterlace
+    # -----------------------------------------------------------------------
+    if detected_mode == "telecine":
+        # Inverse telecine: VFM field matching → VDecimate to drop duplicates
+        # order: 0=BFF, 1=TFF
+        # mode=5: highest quality matching (2-way + 3rd match)
+        clip = core.vivtc.VFM(clip, order=ord_val, mode=5)
+        clip = core.vivtc.VDecimate(clip)
+        # Output: 23.976 fps progressive from 29.97 fps telecined source
 
-# ---------------------------------------------------------------------------
-# 7. Optional resize (after upscale, or standalone)
-# ---------------------------------------------------------------------------
-if upscale_width > 0 and upscale_height > 0:
-    clip = core.resize.Spline36(clip, width=upscale_width, height=upscale_height)
+    elif detected_mode == "interlaced":
+        # True deinterlace using nnedi3 (bob to double rate, then decimate)
+        # field: 0=same rate(keep bottom), 1=same rate(keep top),
+        #        2=double rate(start bottom), 3=double rate(start top)
+        # For same-rate deinterlace: use field=1 for TFF, field=0 for BFF
+        nnedi3_field = 1 if detected_order == "tff" else 0
+        clip = core.nnedi3.nnedi3(clip, field=nnedi3_field, qual=2, nsize=0, nns=3)
 
-clip.set_output()
+    # else: progressive — no processing needed
+
+    # -------------------------------------------------------------------
+    # 6. Optional upscale
+    # -------------------------------------------------------------------
+    if upscale_mode == "vsr":
+        # VapourSynth RVRT video super-resolution (4x)
+        from vsrvrt import SuperRes
+        # Convert to RGBS for RVRT
+        clip = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s="470bg")
+        clip = SuperRes(clip, model="reds", preview_mode=True,
+                        tile_size=(16, 0, 0), tile_overlap=(4, 0, 0),
+                        chunk_overlap=24)
+        # Back to YUV for output
+        clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s="470bg")
+
+    elif upscale_mode == "esrgan":
+        # Real-ESRGAN single-image super-resolution via custom .pth weights
+        # This uses torch directly — load model, process frame-by-frame
+        import torch
+        import numpy as np
+
+        if not esrgan_model or not os.path.isfile(esrgan_model):
+            raise vs.Error(f"VRT_ESRGAN_MODEL not set or file not found: {esrgan_model}")
+
+        # Lazy-load the model on first frame
+        _esrgan_net = [None]
+        _esrgan_scale = [4]  # will be detected from model
+
+        def load_esrgan_model(model_path, device):
+            """Load a Real-ESRGAN .pth state dict and infer architecture."""
+            state_dict = torch.load(model_path, map_location=device, weights_only=False)
+            if "params_ema" in state_dict:
+                state_dict = state_dict["params_ema"]
+            elif "params" in state_dict:
+                state_dict = state_dict["params"]
+
+            # Detect RRDBNet architecture from state dict keys
+            # Standard RRDBNet: conv_first, body.{0..N}.rdb{1,2,3}, conv_body,
+            #   conv_up1, conv_up2, [conv_up3], conv_hr, conv_last
+            from models.network_rrdbnet import RRDBNet
+
+            # Infer num_block from body keys
+            body_keys = [k for k in state_dict if k.startswith("body.") and ".rdb" in k]
+            if body_keys:
+                block_nums = set(int(k.split(".")[1]) for k in body_keys)
+                num_block = max(block_nums) + 1
+            else:
+                num_block = 23  # default
+
+            # Infer scale from conv_up keys
+            up_keys = [k for k in state_dict if k.startswith("conv_up")]
+            scale = 2 ** len(up_keys) if up_keys else 4
+
+            # Infer in/out channels from first/last conv
+            in_nc = state_dict["conv_first.weight"].shape[1]
+            out_nc = state_dict["conv_last.weight"].shape[0]
+            num_feat = state_dict["conv_first.weight"].shape[0]
+
+            model = RRDBNet(in_nc, out_nc, num_feat=num_feat,
+                            num_block=num_block, num_grow_ch=32,
+                            scale=scale)
+            model.load_state_dict(state_dict, strict=True)
+            model.eval().to(device)
+            return model, scale
+
+        def esrgan_process(n, f):
+            """Frame-by-frame ESRGAN processing callback."""
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if _esrgan_net[0] is None:
+                _esrgan_net[0], _esrgan_scale[0] = load_esrgan_model(esrgan_model, device)
+
+            model = _esrgan_net[0]
+            scale = _esrgan_scale[0]
+
+            # Read RGBS frame to numpy → torch
+            planes = [np.asarray(f[0][p]) for p in range(f[0].format.num_planes)]
+            img = np.stack(planes, axis=0)  # [C, H, W] float32
+            tensor = torch.from_numpy(img).unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                output = model(tensor)
+
+            output = output.squeeze(0).clamp(0, 1).cpu().numpy()
+            h, w = output.shape[1], output.shape[2]
+
+            # Create output frame
+            out_frame = f[0].copy()
+            for p in range(3):
+                np.copyto(np.asarray(out_frame[p]), output[p])
+            return out_frame
+
+        # Convert to RGBS for ESRGAN
+        clip_rgb = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s="470bg")
+
+        # We need to create the output clip with the correct dimensions
+        # Use a blank clip at the target size as template
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        test_state = torch.load(esrgan_model, map_location="cpu", weights_only=False)
+        if "params_ema" in test_state:
+            test_state = test_state["params_ema"]
+        elif "params" in test_state:
+            test_state = test_state["params"]
+        up_keys = [k for k in test_state if k.startswith("conv_up")]
+        sr_scale = 2 ** len(up_keys) if up_keys else 4
+        del test_state
+
+        out_w = clip_rgb.width * sr_scale
+        out_h = clip_rgb.height * sr_scale
+
+        blank = core.std.BlankClip(clip_rgb, width=out_w, height=out_h)
+        clip = core.std.ModifyFrame(blank, clips=[clip_rgb], selector=esrgan_process)
+
+        # Back to YUV
+        clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s="470bg")
+
+    else:
+        # No upscale — just ensure output is YUV444P10
+        if clip.format.id != vs.YUV444P10:
+            matrix = "470bg"  # BT.601 for SD content
+            if clip.width >= 1280 or clip.height >= 720:
+                matrix = "709"
+            if clip.format.color_family == vs.RGB:
+                clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s=matrix)
+            else:
+                clip = core.resize.Bicubic(clip, format=vs.YUV444P10)
+
+    # -------------------------------------------------------------------
+    # 7. Optional resize (after upscale, or standalone)
+    # -------------------------------------------------------------------
+    if upscale_width > 0 and upscale_height > 0:
+        clip = core.resize.Spline36(clip, width=upscale_width, height=upscale_height)
+
+    clip.set_output()

@@ -62,8 +62,9 @@ def run_analysis(input_path: str, env: dict) -> dict:
             ["vspipe", "-c", "y4m", VPY_SCRIPT, "-", "-e", "0"],
             env=analysis_env, capture_output=True, text=True, timeout=120,
         )
-        # Script raises SystemExit(0) after writing analysis, vspipe may
-        # report a non-zero exit — that's expected
+        if result.returncode != 0 and result.stderr:
+            print(f"WARNING: analysis vspipe stderr:\n{result.stderr.strip()}",
+                  file=sys.stderr)
         if os.path.isfile(analysis_path):
             with open(analysis_path) as f:
                 return json.load(f)
@@ -135,10 +136,10 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args):
     else:
         cmd += [
             "-c:v", "ffv1", "-level", "3", "-slicecrc", "1",
-            "-slices", "12", "-threads", "12",
+            "-slices", "4", "-threads", "0",
             "-pix_fmt", "yuv444p10le",
         ]
-        print("Encoding: FFV1 lossless (CPU, 12 slices/threads)")
+        print("Encoding: FFV1 lossless (CPU)")
 
     cmd += ["-c:a", "copy", "-shortest", output_path, "-y"]
     return cmd
@@ -325,7 +326,7 @@ def main():
             "vspipe", "-c", "y4m", "-p",
             VPY_SCRIPT, fifo_path,
             "-r", str(args.cframes),
-        ], env=env)
+        ], env=env, stderr=subprocess.PIPE)
 
         vspipe_proc.wait()
         vspipe_exit = vspipe_proc.returncode
@@ -343,7 +344,12 @@ def main():
         pass
 
     if vspipe_exit != 0:
+        stderr_text = ""
+        if vspipe_proc.stderr:
+            stderr_text = vspipe_proc.stderr.read().decode(errors="replace").strip()
         print(f"ERROR: vspipe failed with exit code {vspipe_exit}", file=sys.stderr)
+        if stderr_text:
+            print(f"vspipe error output:\n{stderr_text}", file=sys.stderr)
         sys.exit(1)
     if ffmpeg_exit != 0:
         print(f"ERROR: ffmpeg failed with exit code {ffmpeg_exit}", file=sys.stderr)
