@@ -183,7 +183,6 @@ else:
         # Convert to RGBS for RVRT
         clip = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s="470bg")
         clip = SuperRes(clip, model="reds", preview_mode=True,
-                        tile_size=(16, 0, 0), tile_overlap=(4, 0, 0),
                         chunk_overlap=24)
         # Back to YUV for output
         clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s="470bg")
