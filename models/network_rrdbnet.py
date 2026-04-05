@@ -13,6 +13,18 @@ from torch import nn
 from torch.nn import functional as F
 
 
+def pixel_unshuffle(x, scale):
+    """Reverse of PixelShuffle: rearrange spatial pixels into channels.
+
+    [B, C, H, W] → [B, C*scale*scale, H//scale, W//scale]
+    """
+    b, c, h, w = x.shape
+    assert h % scale == 0 and w % scale == 0
+    h_new, w_new = h // scale, w // scale
+    x = x.view(b, c, h_new, scale, w_new, scale)
+    return x.permute(0, 1, 3, 5, 2, 4).reshape(b, c * scale * scale, h_new, w_new)
+
+
 class ResidualDenseBlock(nn.Module):
     """Residual Dense Block with 5 convolutions."""
 
@@ -66,11 +78,14 @@ class RRDBNet(nn.Module):
                  num_grow_ch=32, scale=4):
         super().__init__()
         self.scale = scale
-        num_upsample = 0
-        s = scale
-        while s > 1:
-            s //= 2
-            num_upsample += 1
+
+        # For scale=2, the input is pixel-unshuffled from [B,C,H,W] to
+        # [B,C*4,H/2,W/2] before conv_first, matching basicsr convention.
+        # For scale=1 (denoise), pixel_unshuffle by 4.
+        if scale == 2:
+            in_nc = in_nc * 4
+        elif scale == 1:
+            in_nc = in_nc * 16
 
         self.conv_first = nn.Conv2d(in_nc, num_feat, 3, 1, 1)
         self.body = nn.ModuleList(
@@ -78,26 +93,34 @@ class RRDBNet(nn.Module):
         )
         self.conv_body = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
 
-        # Upsampling layers
-        self.upsamples = nn.ModuleList()
-        for _ in range(num_upsample):
-            self.upsamples.append(nn.Conv2d(num_feat, num_feat, 3, 1, 1))
+        # basicsr RRDBNet always has exactly conv_up1 + conv_up2 (hardcoded).
+        # Scale difference is handled by pixel_unshuffle at input, not by
+        # the number of upsample layers.
+        self.conv_up1 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
+        self.conv_up2 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
 
         self.conv_hr = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
         self.conv_last = nn.Conv2d(num_feat, out_nc, 3, 1, 1)
         self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
     def forward(self, x):
-        feat = self.conv_first(x)
+        if self.scale == 2:
+            feat = pixel_unshuffle(x, scale=2)
+        elif self.scale == 1:
+            feat = pixel_unshuffle(x, scale=4)
+        else:
+            feat = x
+        feat = self.conv_first(feat)
         body_feat = feat
         for block in self.body:
             body_feat = block(body_feat)
         body_feat = self.conv_body(body_feat)
         feat = feat + body_feat
 
-        for up_conv in self.upsamples:
-            feat = self.lrelu(up_conv(F.interpolate(feat, scale_factor=2,
-                                                     mode="nearest")))
+        feat = self.lrelu(self.conv_up1(F.interpolate(
+            feat, scale_factor=2, mode="nearest")))
+        feat = self.lrelu(self.conv_up2(F.interpolate(
+            feat, scale_factor=2, mode="nearest")))
 
         out = self.conv_last(self.lrelu(self.conv_hr(feat)))
         return out

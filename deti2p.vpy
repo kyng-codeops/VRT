@@ -222,14 +222,25 @@ else:
             else:
                 num_block = 23  # default
 
-            # Infer scale from conv_up keys
-            up_keys = [k for k in state_dict if k.startswith("conv_up")]
-            scale = 2 ** len(up_keys) if up_keys else 4
-
-            # Infer in/out channels from first/last conv
-            in_nc = state_dict["conv_first.weight"].shape[1]
+            # Infer scale: basicsr RRDBNet always has conv_up1+conv_up2.
+            # Scale is determined by pixel_unshuffle on input:
+            #   scale=2: conv_first expects in_ch*4 (pixel_unshuffle by 2)
+            #   scale=1: conv_first expects in_ch*16 (pixel_unshuffle by 4)
+            #   scale=4: conv_first expects in_ch (no pixel_unshuffle)
+            conv_first_ch = state_dict["conv_first.weight"].shape[1]
             out_nc = state_dict["conv_last.weight"].shape[0]
             num_feat = state_dict["conv_first.weight"].shape[0]
+
+            # out_nc is the real channel count (3 for RGB)
+            if conv_first_ch == out_nc * 4:
+                scale = 2
+                in_nc = out_nc
+            elif conv_first_ch == out_nc * 16:
+                scale = 1
+                in_nc = out_nc
+            else:
+                scale = 4
+                in_nc = conv_first_ch
 
             model = RRDBNet(in_nc, out_nc, num_feat=num_feat,
                             num_block=num_block, num_grow_ch=32,
@@ -245,21 +256,32 @@ else:
                 _esrgan_net[0], _esrgan_scale[0] = load_esrgan_model(esrgan_model, device)
 
             model = _esrgan_net[0]
-            scale = _esrgan_scale[0]
+            nf = _num_input_frames
 
-            # Read RGBS frame to numpy → torch
-            planes = [np.asarray(f[0][p]) for p in range(f[0].format.num_planes)]
-            img = np.stack(planes, axis=0)  # [C, H, W] float32
+            if nf > 1:
+                # Multi-frame model: stack nf frames centered on current frame
+                frames_rgb = []
+                half = nf // 2
+                for offset in range(-half, -half + nf):
+                    idx = min(max(n + offset, 0), clip_rgb.num_frames - 1)
+                    fr = clip_rgb.get_frame(idx)
+                    planes = [np.asarray(fr[p]) for p in range(3)]
+                    frames_rgb.append(np.stack(planes, axis=0))
+                img = np.concatenate(frames_rgb, axis=0)  # [nf*3, H, W]
+            else:
+                # Single-frame model: just use f directly
+                planes = [np.asarray(f[p]) for p in range(f.format.num_planes)]
+                img = np.stack(planes, axis=0)  # [3, H, W]
+
             tensor = torch.from_numpy(img).unsqueeze(0).to(device)
 
             with torch.no_grad():
                 output = model(tensor)
 
             output = output.squeeze(0).clamp(0, 1).cpu().numpy()
-            h, w = output.shape[1], output.shape[2]
 
-            # Create output frame
-            out_frame = f[0].copy()
+            # Return a frame matching the output clip (blank) dimensions
+            out_frame = blank.get_frame(n).copy()
             for p in range(3):
                 np.copyto(np.asarray(out_frame[p]), output[p])
             return out_frame
@@ -275,8 +297,18 @@ else:
             test_state = test_state["params_ema"]
         elif "params" in test_state:
             test_state = test_state["params"]
-        up_keys = [k for k in test_state if k.startswith("conv_up")]
-        sr_scale = 2 ** len(up_keys) if up_keys else 4
+        # Detect scale and input channels from weights
+        conv_first_ch = test_state["conv_first.weight"].shape[1]
+        out_nc = test_state["conv_last.weight"].shape[0]
+        if conv_first_ch == out_nc * 4:
+            sr_scale = 2
+        elif conv_first_ch == out_nc * 16:
+            sr_scale = 1
+        else:
+            sr_scale = 4
+
+        _in_nc = out_nc  # actual input channels (before pixel_unshuffle)
+        _num_input_frames = _in_nc // 3  # e.g. 12 actual = 4 frames × 3 RGB
         del test_state
 
         out_w = clip_rgb.width * sr_scale

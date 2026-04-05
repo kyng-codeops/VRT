@@ -14,6 +14,7 @@ Usage:
     python run_deti2p.py -i input.mkv --upscale vsr           # 4x RVRT super-resolution
     python run_deti2p.py -i input.mkv --upscale esrgan --esrgan-model weights.pth
     python run_deti2p.py -i input.mkv --gpu --encoder hevc_nvenc --cq 18
+    python run_deti2p.py -i input.mkv --cpu-hevc --cq 20 --x265-preset slow
 """
 
 import argparse
@@ -135,6 +136,14 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args):
                 "-pix_fmt", "yuv444p10le",
             ]
             print(f"Encoding: {encoder} (GPU), QP={args.cq}")
+    elif args.cpu_hevc:
+        cmd += [
+            "-c:v", "libx265",
+            "-preset", args.x265_preset,
+            "-crf", str(args.cq),
+            "-pix_fmt", "yuv444p10le",
+        ]
+        print(f"Encoding: libx265 (CPU), preset={args.x265_preset}, CRF={args.cq}, 444 10-bit")
     else:
         cmd += [
             "-c:v", "ffv1", "-level", "3", "-slicecrc", "1",
@@ -198,11 +207,19 @@ def parse_args():
     enc_group.add_argument("--gpu", action="store_true",
                            help="Use NVENC GPU encoding instead of FFV1 CPU.\n"
                            "--gpu-lossless takes precedence if both set.")
+    enc_group.add_argument("--cpu-hevc", action="store_true",
+                           help="CPU libx265 HEVC encoding (444 10-bit).\n"
+                           "Avoids GPU contention with upscale models.")
+    enc_group.add_argument("--x265-preset", default="medium",
+                           choices=["ultrafast", "superfast", "veryfast", "faster",
+                                    "fast", "medium", "slow", "slower", "veryslow"],
+                           help="libx265 preset (default: medium)")
     enc_group.add_argument("--encoder", default="hevc_nvenc",
                            choices=["hevc_nvenc", "av1_nvenc"],
                            help="NVENC encoder (default: hevc_nvenc)")
     enc_group.add_argument("--cq", type=int, default=18,
-                           help="Constant QP for NVENC (lower=better, default: 18)")
+                           help="Constant quality value (default: 18).\n"
+                           "CRF for --cpu-hevc, QP for --gpu.")
 
     args = parser.parse_args()
 
