@@ -19,12 +19,24 @@ Computer Vision Lab, ETH Zurich & Meta Inc.
 ![visitors](https://visitor-badge.glitch.me/badge?page_id=jingyunliang/VRT)
 [ <a href="https://colab.research.google.com/gist/JingyunLiang/deb335792768ad9eb73854a8efca4fe0#file-vrt-demo-on-video-restoration-ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="google colab logo"></a>](https://colab.research.google.com/gist/JingyunLiang/deb335792768ad9eb73854a8efca4fe0#file-vrt-demo-on-video-restoration-ipynb)
 
+---
 VRT is VapourSynth plugin and stands for "Video Restoration Transformer".
-I forked a copy to add my user notes and any customizations. For now the repo is as is other than some notes and maybe vapoursynth script examples.
+# Development Fork
+by kyng-codeops:
 
+I forked a copy to develop CLI tools to drive vapoursynth vpy scripts for a few workflows. I needed the fork as I'm planning on redevelop the VSR model with custom mods. Previously I modified RealESRGAN loss models and discriminator networks such that the ESRGAN generator was able to recover fine details on real videos and images. 
 
-This repository is my forked PyTorch copy of "VRT: A Video Restoration Transformer"
-(original work from [arxiv](https://arxiv.org/pdf/2201.12288.pdf), [supp](https://github.com/JingyunLiang/VRT/releases/download/v0.0/VRT_supplementary.pdf), [pretrained models](https://github.com/JingyunLiang/VRT/releases), [visual results](https://github.com/JingyunLiang/VRT/releases)). VRT achieves state-of-the-art performance in
+I stopped comparing my model results with metrics because I found the metrics deviated significantly from visual inspection. LPIPS and NIQE generally trended in good directions and only served to help decide on stopping points and checkpoint pth file selection.  Thus I don't have the typical metrics for the comparison because I resolted to visually compared results from the publicly available RealESRGAN variants which are only good for cartoons and animation. 
+
+My custom ESRGAN weights were able to recover fine details, wrinkles in skin, goose bumps, textures on clothing and more. I intend to use those same techniques to modify the VSR discriminator and loss models as well as add to the degradation methodology. RealESRGAN does not simulate RGB to YUV conversion losses when videos are transcoded multiple times at different scales.  
+
+For now, most of my progress is in my vpy-toolkit. See custom patching notes for my RTX4090, some intro level vpy notes, followed by what my toolkit does down below. The GoPro deblur I'm using as is so there's a nice driver script for that in the toolkit.
+
+---
+
+Original work from:
+
+([arxiv](https://arxiv.org/pdf/2201.12288.pdf), [supp](https://github.com/JingyunLiang/VRT/releases/download/v0.0/VRT_supplementary.pdf), [pretrained models](https://github.com/JingyunLiang/VRT/releases), [visual results](https://github.com/JingyunLiang/VRT/releases)). VRT achieves state-of-the-art performance in
 - video SR (REDS, Vimeo90K, Vid4, UDM10) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; :heart_eyes: **+ 0.33~0.51dB** :heart_eyes:
 - video deblurring (GoPro, DVD, REDS) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; :heart_eyes: &nbsp;&nbsp;&nbsp; **+ 1.47~2.15dB** &nbsp;&nbsp;&nbsp; :heart_eyes: 
 - video denoising (DAVIS, Set8)   &nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; :heart_eyes: &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; **+ 1.56~2.16dB** &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; :heart_eyes:
@@ -77,6 +89,8 @@ This repository is my forked PyTorch copy of "VRT: A Video Restoration Transform
 1. [Training](#Training)
 1. [Results](#Results)
 1. [Basic Usage](#basic-usage)
+1. [Patching](#applying-patches)
+1. [My toolkit](#vpy-toolkit)
 1. [Citation](#Citation)
 1. [License and Acknowledgement](#License-and-Acknowledgement)
 
@@ -302,6 +316,89 @@ clip = rvrt(clip,
 
 clip.set_output()
 ```
+
+### vpy-toolkit
+
+The toolkit is a collection of Python CLI runners and VapourSynth `.vpy` scripts for end-to-end video restoration workflows. Each runner handles the full pipeline: source analysis → VapourSynth processing → FIFO pipe → ffmpeg encoding, with graceful Ctrl+C cleanup.
+
+All pipelines output MKV containers and default to FFV1 lossless encoding. GPU (NVENC) and CPU HEVC encoding options are available.
+
+#### Tools
+
+| Script | VapourSynth Script | Purpose |
+|--------|-------------------|---------|
+| `run_deti2p.py` | `deti2p.vpy` | Detelecine (IVTC) and deinterlace to progressive |
+| `run_motion_deblur.py` | `motion_deblur.vpy` | GoPro-trained VRT motion deblur |
+| `run_fps_interpolate.py` | `fps_interpolate.vpy` | RIFE frame rate interpolation with scene-cut detection |
+| `detect_tip.py` | — | Standalone TIP detector (telecine / interlace / progressive) |
+
+#### Detelecine / Deinterlace (`run_deti2p.py`)
+
+Auto-detects whether the source is telecined (3:2 pulldown), interlaced, or progressive, then applies the correct processing. Optionally upscales with ESRGAN or VRT/RVRT VSR.
+
+```bash
+# Auto-detect and process with FFV1 lossless output
+python run_deti2p.py -i input.mp4
+
+# Analyze only — detect telecine/interlace, no output file
+python run_deti2p.py -i input.mp4 --analyze
+
+# Force deinterlace with BFF field order
+python run_deti2p.py -i input.mp4 --mode deinterlace --field-order bff
+
+# Upscale 2x with custom ESRGAN weights, CPU HEVC encoding
+python run_deti2p.py -i input.mp4 --upscale esrgan --esrgan-model weights.pth --cpu-hevc --cq 20
+
+# Upscale 4x with VRT/RVRT VSR
+python run_deti2p.py -i input.mp4 --upscale vsr --cpu-hevc --cq 18 --x265-preset slow
+
+# GPU NVENC encoding
+python run_deti2p.py -i input.mp4 --gpu --encoder hevc_nvenc --cq 18
+```
+
+The ESRGAN upscaler loads any basicsr-compatible RRDBNet `.pth` file and auto-detects the scale factor (1x/2x/4x) from the weights — no configuration needed.
+
+#### Motion Deblur (`run_motion_deblur.py`)
+
+Applies the GoPro-trained VRT deblur model frame-by-frame.
+
+```bash
+python run_motion_deblur.py -i blurry_video.mp4
+python run_motion_deblur.py -i blurry_video.mp4 --gpu-lossless
+```
+
+#### Frame Rate Interpolation (`run_fps_interpolate.py`)
+
+RIFE-based frame interpolation with motion-adaptive blending and automatic scene-cut detection to avoid cross-scene artifacts.
+
+```bash
+# Double the frame rate (default)
+python run_fps_interpolate.py -i input.mp4
+
+# 4x frame rate
+python run_fps_interpolate.py -i input.mp4 --factor 4
+```
+
+#### TIP Detector (`detect_tip.py`)
+
+Standalone source analysis tool. Splits the video into scenes, runs ffmpeg's `idet` filter on each, and reports a duration-weighted verdict: telecine (hard or soft), interlaced (TFF/BFF), or progressive.
+
+```bash
+python detect_tip.py -i input.mp4
+```
+
+#### Encoding Options
+
+All runners share these encoding flags (where available):
+
+| Flag | Description |
+|------|-------------|
+| *(default)* | FFV1 lossless, CPU |
+| `--gpu` | NVENC lossy (HEVC or AV1), configurable QP |
+| `--gpu-lossless` | NVENC AV1 lossless, 444 10-bit |
+| `--cpu-hevc` | libx265 CRF encoding, 444 10-bit — keeps GPU free for model inference |
+| `--cq N` | Quality value: QP for `--gpu`, CRF for `--cpu-hevc` (default: 18) |
+| `--x265-preset` | libx265 speed preset (default: medium) |
 
 
 
