@@ -134,6 +134,8 @@ elif mode == "ivtc":
     detected_mode = "telecine"
 elif mode == "deinterlace":
     detected_mode = "interlaced"
+elif mode == "progressive":
+    detected_mode = "progressive"
 else:
     detected_mode = "telecine"
 
@@ -157,7 +159,7 @@ else:
     # 5. Process: IVTC or Deinterlace
     # -----------------------------------------------------------------------
     if detected_mode == "telecine":
-        # Inverse telecine: VFM field matching → VDecimate to drop duplicates
+        # Hard telecine: VFM field matching → VDecimate to drop duplicates
         # order: 0=BFF, 1=TFF
         # mode=5: highest quality matching (2-way + 3rd match)
         clip = core.vivtc.VFM(clip, order=ord_val, mode=5)
@@ -192,6 +194,12 @@ else:
         # This uses torch directly — load model, process frame-by-frame
         import torch
         import numpy as np
+        import threading
+
+        # Serialize GPU access — VapourSynth calls ModifyFrame from multiple
+        # threads but CUDA inference must be single-threaded to avoid OOM /
+        # deadlocks from concurrent kernel launches.
+        _esrgan_lock = threading.Lock()
 
         if not esrgan_model or not os.path.isfile(esrgan_model):
             raise vs.Error(f"VRT_ESRGAN_MODEL not set or file not found: {esrgan_model}")
@@ -250,40 +258,44 @@ else:
 
         def esrgan_process(n, f):
             """Frame-by-frame ESRGAN processing callback."""
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            if _esrgan_net[0] is None:
-                _esrgan_net[0], _esrgan_scale[0] = load_esrgan_model(esrgan_model, device)
+            with _esrgan_lock:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                if _esrgan_net[0] is None:
+                    _esrgan_net[0], _esrgan_scale[0] = load_esrgan_model(esrgan_model, device)
 
-            model = _esrgan_net[0]
-            nf = _num_input_frames
+                model = _esrgan_net[0]
+                nf = _num_input_frames
 
-            if nf > 1:
-                # Multi-frame model: stack nf frames centered on current frame
-                frames_rgb = []
-                half = nf // 2
-                for offset in range(-half, -half + nf):
-                    idx = min(max(n + offset, 0), clip_rgb.num_frames - 1)
-                    fr = clip_rgb.get_frame(idx)
-                    planes = [np.asarray(fr[p]) for p in range(3)]
-                    frames_rgb.append(np.stack(planes, axis=0))
-                img = np.concatenate(frames_rgb, axis=0)  # [nf*3, H, W]
-            else:
-                # Single-frame model: just use f directly
-                planes = [np.asarray(f[p]) for p in range(f.format.num_planes)]
-                img = np.stack(planes, axis=0)  # [3, H, W]
+                if nf > 1:
+                    # Multi-frame model: stack nf frames centered on current frame
+                    frames_rgb = []
+                    half = nf // 2
+                    for offset in range(-half, -half + nf):
+                        idx = min(max(n + offset, 0), clip_rgb.num_frames - 1)
+                        fr = clip_rgb.get_frame(idx)
+                        planes = [np.asarray(fr[p]) for p in range(3)]
+                        frames_rgb.append(np.stack(planes, axis=0))
+                    img = np.concatenate(frames_rgb, axis=0)  # [nf*3, H, W]
+                else:
+                    # Single-frame model: just use f directly
+                    planes = [np.asarray(f[p]) for p in range(f.format.num_planes)]
+                    img = np.stack(planes, axis=0)  # [3, H, W]
 
-            tensor = torch.from_numpy(img).unsqueeze(0).to(device)
+                tensor = torch.from_numpy(img).unsqueeze(0).to(device)
 
-            with torch.no_grad():
-                output = model(tensor)
+                with torch.no_grad():
+                    output = model(tensor)
 
-            output = output.squeeze(0).clamp(0, 1).cpu().numpy()
+                output = output.squeeze(0).clamp(0, 1).cpu().numpy()
+                del tensor
+                if device.type == "cuda" and n % 100 == 0:
+                    torch.cuda.empty_cache()
 
-            # Return a frame matching the output clip (blank) dimensions
-            out_frame = blank.get_frame(n).copy()
-            for p in range(3):
-                np.copyto(np.asarray(out_frame[p]), output[p])
-            return out_frame
+                # Return a frame matching the output clip (blank) dimensions
+                out_frame = blank.get_frame(n).copy()
+                for p in range(3):
+                    np.copyto(np.asarray(out_frame[p]), output[p])
+                return out_frame
 
         # Convert to RGBS for ESRGAN
         clip_rgb = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s="470bg")
@@ -316,6 +328,11 @@ else:
         blank = core.std.BlankClip(clip_rgb, width=out_w, height=out_h)
         clip = core.std.ModifyFrame(blank, clips=[clip_rgb], selector=esrgan_process)
 
+        # Limit VapourSynth threads — GPU inference is single-threaded via lock,
+        # extra threads just queue frames that consume RAM while waiting.
+        core.num_threads = 2
+        core.max_cache_size = 1024  # 1GB is plenty for serial GPU processing
+
         # Back to YUV
         clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s="470bg")
 
@@ -331,9 +348,30 @@ else:
                 clip = core.resize.Bicubic(clip, format=vs.YUV444P10)
 
     # -------------------------------------------------------------------
-    # 7. Optional resize (after upscale, or standalone)
+    # 7. DAR correction — resize to square pixels (--dar correct)
+    #    Prefers shrinking the larger axis via Lanczos for sharpness.
     # -------------------------------------------------------------------
-    if upscale_width > 0 and upscale_height > 0:
-        clip = core.resize.Spline36(clip, width=upscale_width, height=upscale_height)
+    if os.environ.get("VRT_DAR_CORRECT") == "1":
+        sar_num = int(os.environ.get("VRT_SAR_NUM", "1"))
+        sar_den = int(os.environ.get("VRT_SAR_DEN", "1"))
+        if sar_num != sar_den:
+            sar = sar_num / sar_den
+            if sar > 1:
+                # Wide pixels: shrink height to match
+                new_h = int(round(clip.height / sar / 2)) * 2
+                clip = core.resize.Lanczos(clip, width=clip.width, height=new_h)
+            else:
+                # Tall pixels: shrink width to match
+                new_w = int(round(clip.width * sar / 2)) * 2
+                clip = core.resize.Lanczos(clip, width=new_w, height=clip.height)
+
+    # -------------------------------------------------------------------
+    # 8. Optional resize (after upscale / DAR correction)
+    #    Specifying only --width or --height keeps the other dimension as-is.
+    # -------------------------------------------------------------------
+    rw = upscale_width if upscale_width > 0 else clip.width
+    rh = upscale_height if upscale_height > 0 else clip.height
+    if rw != clip.width or rh != clip.height:
+        clip = core.resize.Spline36(clip, width=rw, height=rh)
 
     clip.set_output()

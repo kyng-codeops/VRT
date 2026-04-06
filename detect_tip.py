@@ -83,18 +83,21 @@ def _parse_frame_count(stderr):
 
 def check_hard_telecine(video_path, fps_val, duration_sec,
                         sample_duration=10.0):
-    """Detect hard telecine (3:2 pulldown baked into progressive frames).
+    """Detect telecine (3:2 pulldown) and distinguish hard from soft.
 
-    MPEG-2 hard telecine uses repeat_first_field (RFF) flags to signal 3:2
-    pulldown.  ffmpeg's decoder honours RFF and outputs only unique frames,
-    so a 29.97fps container actually decodes ~23.976fps of unique frames.
-    We detect this by comparing the container fps to the actual decoded
-    frame rate over a sample window.
+    Both hard and soft telecine produce ~23.976fps decoded from a 29.97fps
+    container.  The difference:
+      - Soft telecine: progressive frames with repeat_pict (RFF) flags
+        telling the decoder to repeat fields.  The flags can be stripped
+        to recover 23.976fps progressive without any IVTC processing.
+      - Hard telecine: interlaced frames with no RFF flags.  Requires
+        full IVTC (field matching + decimation) to recover 23.976fps.
 
-    Returns (is_hard_telecine, fps_ratio).
+    Returns (telecine_type, fps_ratio) where telecine_type is one of:
+      "none", "soft", "hard"
     """
     if not (29.9 < fps_val < 30.1):
-        return False, 0.0
+        return "none", 0.0
 
     # Sample from the middle of the video to avoid logos/credits
     sample_start = max(0, (duration_sec / 2) - (sample_duration / 2))
@@ -112,14 +115,37 @@ def check_hard_telecine(video_path, fps_val, duration_sec,
     decoded_frames = _parse_frame_count(result.stderr)
 
     if decoded_frames == 0:
-        return False, 0.0
+        return "none", 0.0
 
     actual_fps = decoded_frames / sample_duration
     fps_ratio = fps_val / actual_fps
 
     # 3:2 pulldown: container 29.97 / decoded 23.976 = ratio ~1.25 (5:4)
-    is_hard_telecine = 1.20 <= fps_ratio <= 1.30
-    return is_hard_telecine, fps_ratio
+    if not (1.20 <= fps_ratio <= 1.30):
+        return "none", fps_ratio
+
+    # Telecine detected — check for repeat_pict flags to distinguish soft vs hard
+    # Soft telecine has repeat_pict > 0 on some frames (RFF flags)
+    probe_cmd = [
+        "ffprobe", "-hide_banner",
+        "-read_intervals", f"{sample_start}%+{min(sample_duration, 5.0)}",
+        "-select_streams", "v:0",
+        "-show_entries", "frame=repeat_pict",
+        "-of", "csv=p=0",
+        video_path,
+    ]
+    probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+    repeat_pict_values = []
+    for x in probe_result.stdout.strip().split("\n"):
+        x = x.strip().rstrip(",")
+        if x.isdigit():
+            repeat_pict_values.append(int(x))
+    has_rff = any(v > 0 for v in repeat_pict_values)
+
+    if has_rff:
+        return "soft", fps_ratio
+    else:
+        return "hard", fps_ratio
 
 
 def classify_scene(counts):
@@ -163,14 +189,22 @@ def quick_detect(video_path, sample_duration=30.0):
         fps_val = float(fps)
         duration_sec = float(container.duration / 1_000_000) if container.duration else 0
 
-    # --- Hard telecine check (MPEG-2 RFF / 3:2 pulldown baked in) ---
-    is_hard_tc, tc_fps_ratio = check_hard_telecine(video_path, fps_val, duration_sec)
-    if is_hard_tc:
+    # --- Telecine check (hard vs soft 3:2 pulldown) ---
+    tc_type, tc_fps_ratio = check_hard_telecine(video_path, fps_val, duration_sec)
+    if tc_type == "hard":
         actual_fps = fps_val / tc_fps_ratio
         return {
             "mode": "telecine",
             "field_order": "tff",  # hard TC doesn't have a meaningful field order
             "detail": f"Hard telecine (container {fps_val:.2f}fps, decoded {actual_fps:.2f}fps)",
+        }
+    elif tc_type == "soft":
+        actual_fps = fps_val / tc_fps_ratio
+        return {
+            "mode": "telecine",
+            "field_order": "tff",
+            "telecine_type": "soft",
+            "detail": f"Soft telecine (container {fps_val:.2f}fps, decoded {actual_fps:.2f}fps, RFF flags present)",
         }
 
     # --- idet-based detection on a sample from the middle ---
@@ -233,22 +267,22 @@ def analyze_video(video_path, sample_frames=50):
     print(f"Duration: {duration_sec:.1f}s")
     print(f"Sampling {sample_frames} frames ({sample_duration:.2f}s) per scene\n")
 
-    # Pre-check for hard telecine (3:2 pulldown baked into progressive frames)
-    print("Checking for hard telecine...")
-    is_hard_tc, tc_fps_ratio = check_hard_telecine(video_path, fps_val, duration_sec)
-    if is_hard_tc:
+    # Pre-check for telecine (3:2 pulldown — soft or hard)
+    print("Checking for telecine...")
+    tc_type, tc_fps_ratio = check_hard_telecine(video_path, fps_val, duration_sec)
+    if tc_type != "none":
         actual_fps = fps_val / tc_fps_ratio
-        print(f"Hard telecine detected (container {fps_val:.2f}fps, decoded {actual_fps:.2f}fps, ratio {tc_fps_ratio:.3f})\n")
+        print(f"{tc_type.capitalize()} telecine detected (container {fps_val:.2f}fps, decoded {actual_fps:.2f}fps, ratio {tc_fps_ratio:.3f})\n")
     else:
-        print(f"No hard telecine pattern (fps ratio: {tc_fps_ratio:.3f})\n")
+        print(f"No telecine pattern (fps ratio: {tc_fps_ratio:.3f})\n")
 
     print("Detecting scene boundaries...")
     scenes = get_scene_timecodes(video_path)
     print(f"Found {len(scenes)} scenes\n")
 
     # Summary counters (scene count and duration-weighted)
-    summary = {"Progressive": 0, "Hard Telecine": 0, "Telecined": 0, "Interlaced": 0, "Undetermined": 0, "Unknown": 0}
-    weighted = {"Progressive": 0.0, "Hard Telecine": 0.0, "Telecined": 0.0, "Interlaced": 0.0, "Undetermined": 0.0, "Unknown": 0.0}
+    summary = {"Progressive": 0, "Soft Telecine": 0, "Hard Telecine": 0, "Telecined": 0, "Interlaced": 0, "Undetermined": 0, "Unknown": 0}
+    weighted = {"Progressive": 0.0, "Soft Telecine": 0.0, "Hard Telecine": 0.0, "Telecined": 0.0, "Interlaced": 0.0, "Undetermined": 0.0, "Unknown": 0.0}
 
     for i, (start, end) in enumerate(scenes):
         scene_dur = end - start
@@ -256,15 +290,18 @@ def analyze_video(video_path, sample_frames=50):
         counts = analyze_scene_idet(video_path, start, dur)
         classification = classify_scene(counts)
 
-        # Override progressive/undetermined → hard telecine when globally detected
-        if is_hard_tc and classification in ("Progressive", "Undetermined"):
-            classification = "Hard Telecine (3:2 pulldown)"
+        # Override progressive/undetermined when global telecine detected
+        if tc_type != "none" and classification in ("Progressive", "Undetermined"):
+            tc_label = "Soft" if tc_type == "soft" else "Hard"
+            classification = f"{tc_label} Telecine (3:2 pulldown)"
 
         print(f"Scene {i:4d} [{start:8.2f}s - {end:8.2f}s]: {classification}  "
               f"(TFF:{counts['tff']} BFF:{counts['bff']} Prog:{counts['progressive']} Undet:{counts['undetermined']})")
 
         # Bucket by label
-        if "Hard Telecine" in classification:
+        if "Soft Telecine" in classification:
+            key = "Soft Telecine"
+        elif "Hard Telecine" in classification:
             key = "Hard Telecine"
         elif "Progressive" in classification:
             key = "Progressive"
@@ -291,13 +328,18 @@ def analyze_video(video_path, sample_frames=50):
         print(f"  {label:15s}: {count:4d} scenes ({pct:5.1f}%)  {weighted[label]:8.1f}s ({dur_pct:5.1f}%)")
 
     # Overall verdict — use duration-weighted classification
-    tc_dur = weighted["Hard Telecine"] + weighted["Telecined"]
+    tc_dur = weighted["Hard Telecine"] + weighted["Soft Telecine"] + weighted["Telecined"]
     il_dur = weighted["Interlaced"]
     prog_dur = weighted["Progressive"]
 
     if tc_dur > il_dur and tc_dur > prog_dur:
-        tc_type = "Hard telecine" if weighted["Hard Telecine"] > weighted["Telecined"] else "Telecined"
-        print(f"\nVerdict: {tc_type} content — use IVTC (inverse telecine)")
+        if weighted["Soft Telecine"] > weighted["Hard Telecine"]:
+            tc_label = "Soft telecine"
+        elif weighted["Hard Telecine"] > 0:
+            tc_label = "Hard telecine"
+        else:
+            tc_label = "Telecined"
+        print(f"\nVerdict: {tc_label} content — use IVTC (inverse telecine)")
     elif il_dur > prog_dur:
         print(f"\nVerdict: Interlaced content — use deinterlace (nnedi3)")
     elif tc_dur + il_dur > 0:
