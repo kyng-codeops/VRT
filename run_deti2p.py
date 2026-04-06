@@ -50,6 +50,19 @@ def get_resolution(input_path: str) -> tuple[int, int]:
         return stream.width, stream.height
 
 
+def get_sar(input_path: str) -> tuple[int, int]:
+    """Get sample aspect ratio (SAR) from input video as (num, den).
+
+    Returns (1, 1) for square pixels or if SAR is not set.
+    """
+    with av.open(input_path) as container:
+        stream = container.streams.video[0]
+        sar = stream.sample_aspect_ratio
+        if sar is None or sar == 0:
+            return 1, 1
+        return sar.numerator, sar.denominator
+
+
 def run_analysis(input_path: str, env: dict) -> dict:
     """Run the .vpy in analysis-only mode to detect field order and telecine."""
     with tempfile.NamedTemporaryFile(suffix=".json", prefix="vrt_analysis_",
@@ -102,7 +115,8 @@ def compute_output_fps(src_fps_num: int, src_fps_den: int, mode: str) -> tuple[i
         return src_fps_num, src_fps_den
 
 
-def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args):
+def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args,
+                     sar_num=1, sar_den=1):
     """Build the ffmpeg command based on encoding mode."""
     cmd = [
         "ffmpeg", "-hide_banner", "-stats",
@@ -152,6 +166,11 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args):
         ]
         print("Encoding: FFV1 lossless (CPU)")
 
+    # For --dar copy, embed SAR metadata so players display correct aspect ratio
+    if args.dar == "copy" and (sar_num != 1 or sar_den != 1):
+        cmd += ["-vf", f"setsar={sar_num}/{sar_den}"]
+        print(f"DAR:      copy SAR {sar_num}:{sar_den} to output")
+
     cmd += ["-c:a", "copy", "-shortest", output_path, "-y"]
     return cmd
 
@@ -199,6 +218,13 @@ def parse_args():
                           help="Output width (resize after upscale, 0=no resize)")
     up_group.add_argument("--height", type=int, default=0,
                           help="Output height (resize after upscale, 0=no resize)")
+    up_group.add_argument("--dar", default="none",
+                          choices=["none", "copy", "correct"],
+                          help="Display aspect ratio handling (default: none).\n"
+                          "  none:    ignore source DAR\n"
+                          "  copy:    copy source SAR metadata to output\n"
+                          "  correct: resize to square pixels using source DAR\n"
+                          "           (prefers shrinking the larger axis via Lanczos)")
 
     # Encoding
     enc_group = parser.add_argument_group("encoding")
@@ -245,6 +271,9 @@ def main():
         if not Path(esrgan_model_path).is_file():
             sys.exit(f"ERROR: ESRGAN model not found: {esrgan_model_path}")
 
+    # Resolve output path before chdir so it's relative to the user's CWD
+    user_output = str(Path(args.output).resolve()) if args.output else None
+
     # chdir to script dir so vspipe can find the .vpy and models/
     os.chdir(script_dir)
 
@@ -265,11 +294,21 @@ def main():
     src_fps_num, src_fps_den = get_framerate(input_path)
     src_fps = src_fps_num / src_fps_den
     src_w, src_h = get_resolution(input_path)
+    sar_num, sar_den = get_sar(input_path)
+    sar_is_nonsquare = (sar_num != sar_den)
 
+    # Pass DAR correction info to .vpy for --dar correct
+    if args.dar == "correct" and sar_is_nonsquare:
+        env["VRT_DAR_CORRECT"] = "1"
+        env["VRT_SAR_NUM"] = str(sar_num)
+        env["VRT_SAR_DEN"] = str(sar_den)
+
+    sar_str = f" SAR {sar_num}:{sar_den}" if sar_is_nonsquare else ""
     print(f"Input:      {input_path}")
-    print(f"Source:     {src_w}x{src_h} @ {src_fps_num}/{src_fps_den} ({src_fps:.4f} fps)")
+    print(f"Source:     {src_w}x{src_h}{sar_str} @ {src_fps_num}/{src_fps_den} ({src_fps:.4f} fps)")
 
     # --- Auto-detection via idet (when mode or field-order is auto) ---
+    is_soft_telecine = False
     if args.mode == "auto" or args.field_order == "auto":
         print("Analyzing field structure (idet)...")
         tip = quick_detect(input_path)
@@ -277,6 +316,12 @@ def main():
 
         if args.mode == "auto":
             detected_mode = tip["mode"]
+            # Soft telecine: ffms2 strips RFF flags and outputs progressive
+            # at native fps (23.976), so no IVTC processing needed
+            if detected_mode == "telecine" and tip.get("telecine_type") == "soft":
+                detected_mode = "progressive"
+                is_soft_telecine = True
+                print("Note:       Soft telecine — ffms2 already outputs progressive 23.976fps")
         else:
             detected_mode = {"ivtc": "telecine", "deinterlace": "interlaced"}[args.mode]
 
@@ -289,16 +334,20 @@ def main():
         detected_order = args.field_order
 
     # Set env so the .vpy skips its own auto-detect and uses these values
-    env["VRT_MODE"] = {"telecine": "ivtc", "interlaced": "deinterlace", "progressive": "auto"}[detected_mode]
+    env["VRT_MODE"] = {"telecine": "ivtc", "interlaced": "deinterlace",
+                       "progressive": "progressive"}[detected_mode]
     env["VRT_FIELD_ORDER"] = detected_order
 
     mode_labels = {
-        "telecine": "Telecine (3:2 pulldown) \u2192 IVTC",
+        "telecine": "Telecine (3:2 pulldown) → IVTC",
         "interlaced": "True interlace \u2192 nnedi3 deinterlace",
         "progressive": "Progressive (no processing needed)",
     }
     print(f"Field order: {detected_order.upper()}")
-    print(f"Mode:        {mode_labels.get(detected_mode, detected_mode)}")
+    label = mode_labels.get(detected_mode, detected_mode)
+    if is_soft_telecine:
+        label = "Soft telecine → progressive (ffms2 handles RFF)"
+    print(f"Mode:        {label}")
 
     if args.analyze:
         print("\nAnalysis complete (--analyze mode, no output generated).")
@@ -306,22 +355,32 @@ def main():
 
     # Compute output framerate
     out_fps_num, out_fps_den = compute_output_fps(src_fps_num, src_fps_den, detected_mode)
+    # For soft telecine, ffms2 outputs at native 23.976fps — override container fps
+    if is_soft_telecine and abs(src_fps - 29.97) < 0.5:
+        out_fps_num, out_fps_den = 24000, 1001
     out_fps = out_fps_num / out_fps_den
     fps_str = f"{out_fps_num}/{out_fps_den}"
 
     # Determine output name
-    if args.output:
-        output_path = str(Path(args.output).resolve() if not Path(args.output).is_absolute()
-                         else Path(args.output))
-        output_path = str(Path(output_path).with_suffix(".mkv"))
+    if user_output:
+        output_path = str(Path(user_output).with_suffix(".mkv"))
     else:
-        suffix = "_ivtc" if detected_mode == "telecine" else "_deinterlaced"
+        if detected_mode == "telecine":
+            suffix = "_ivtc"
+        elif is_soft_telecine:
+            suffix = "_prog"
+        else:
+            suffix = "_deinterlaced"
         stem = Path(input_path).stem
         output_path = str(Path(input_path).parent / f"{stem}{suffix}.mkv")
 
     upscale_label = {"none": "none", "vsr": "RVRT 4x VSR", "esrgan": f"Real-ESRGAN ({Path(esrgan_model_path).name})"}
     print(f"Output FPS: {fps_str} ({out_fps:.4f})")
     print(f"Upscale:    {upscale_label.get(args.upscale, args.upscale)}")
+    if args.dar != "none" and sar_is_nonsquare:
+        dar_labels = {"copy": f"copy SAR {sar_num}:{sar_den} metadata",
+                      "correct": f"correct to square pixels (SAR {sar_num}:{sar_den}, Lanczos shrink)"}
+        print(f"DAR:        {dar_labels[args.dar]}")
     print(f"Output:     {output_path}")
 
     # Create named pipe
@@ -365,7 +424,8 @@ def main():
     signal.signal(signal.SIGTERM, cleanup)
 
     try:
-        ffmpeg_cmd = build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args)
+        ffmpeg_cmd = build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args,
+                                      sar_num=sar_num, sar_den=sar_den)
         # start_new_session=True puts children in their own process group
         # so terminal Ctrl+C only goes to Python, giving us full cleanup control
         ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, start_new_session=True)
