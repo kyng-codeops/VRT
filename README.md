@@ -77,7 +77,20 @@ Original work from:
 
 ---
 
-> Video restoration (e.g., video super-resolution) aims to restore high-quality frames from low-quality frames. Different from single image restoration, video restoration generally requires to utilize temporal information from multiple adjacent but usually misaligned video frames. Existing deep methods generally tackle with this by exploiting a sliding window strategy or a recurrent architecture, which either is restricted by frame-by-frame restoration or lacks long-range modelling ability. In this paper, we propose a Video Restoration Transformer (VRT) with parallel frame prediction and long-range temporal dependency modelling abilities. More specifically, VRT is composed of multiple scales, each of which consists of two kinds of modules: temporal mutual self attention (TMSA) and parallel warping. TMSA divides the video into small clips, on which mutual attention is applied for joint motion estimation, feature alignment and feature fusion, while self-attention is used for feature extraction. To enable cross-clip interactions, the video sequence is shifted for every other layer. Besides, parallel warping is used to further fuse information from neighboring frames by parallel feature warping. Experimental results on three tasks, including video super-resolution, video deblurring and video denoising, demonstrate that VRT outperforms the state-of-the-art methods by large margins (up to 2.16 dB) on nine benchmark datasets.
+> Video restoration (e.g., video super-resolution) aims to restore high-quality frames from low-quality frames. Different from single image restoration, video restoration generally requires utilizing temporal information from multiple adjacent and often misaligned video frames. Existing deep methods generally tackle this by exploiting a sliding window strategy or a recurrent architecture, which either is restricted to frame-by-frame restoration or lacks long-range modelling ability. 
+
+In this paper, we propose a Video Restoration Transformer (VRT) with parallel frame prediction and long-range temporal dependency modelling. More specifically, VRT is composed from multiple scales, each consisting of two distinct modules: temporal mutual self attention (TMSA) and parallel warping. 
+
+TMSA divides the video into small clips, on which mutual attention is applied for joint motion estimation, feature alignment and feature fusion, while self-attention is used for feature extraction. To enable cross-clip interactions, the video sequence is shifted for every other layer. 
+
+Parallel feature warping is used to further fuse information from neighboring frames. 
+
+Experimental results on three tasks 
+  - video super-resolution
+  - video deblurring
+  - video denoising
+
+demonstrate that VRT can outperform the state-of-the-art methods by a large margins (up to 2.16 dB) on nine benchmark datasets.
 <p align="center">
   <img width="800" src="assets/framework.jpeg">
 </p>
@@ -210,11 +223,9 @@ Space-Time Video Super-Resolution
 
 ## Local Modifications to vsrvrt
 
-### Preview Mode Chunk Cache Eviction
+### 'Preview Mode' Chunk Cache Eviction
 
-**Affects**: vsrvrt 1.0.0 through 1.1.3 (latest as of April 2026). Bug is present in all released versions.
-
-The `preview_mode=True` path in `vsrvrt` (`rvrt_filter.py :: _create_filter_wrapper_preview`) processes chunks lazily on-demand, which is essential for long videos piped through vspipe/ffmpeg. However, the chunk cache (`chunk_cache` dict) grows without bound — every processed chunk is kept in CPU RAM indefinitely. For an 83,760-frame video at chunk_size=64, this eventually accumulates ~500 GB of tensors and triggers the OOM killer.
+The `preview_mode=True` path in `vsrvrt` (`rvrt_filter.py :: _create_filter_wrapper_preview`) processes chunks lazily on-demand, which is essential for long videos piped through vspipe/ffmpeg. However, the chunk cache (`chunk_cache` dict) grows without bound — every processed chunk is kept in CPU RAM indefinitely. For an 83,760-frame video at chunk_size=64, this eventually accumulates ~500 GB of tensors and triggers the OOM process killer.
 
 **Fix**: Added cache eviction after storing each new chunk, keeping at most 3 chunks in memory. Since vspipe requests frames sequentially, only the current chunk is ever needed; the extra 2 slots provide a safety margin.
 
@@ -230,6 +241,8 @@ if len(chunk_cache) > max_cached:
 
 > **Note**: The default (non-preview) chunked mode (`_create_filter_wrapper_chunked`) has the same problem — it eagerly processes all chunks before returning any frames. Always use `preview_mode=True` for long videos piped to ffmpeg.
 
+**Affects**: vsrvrt 1.0.0 through 1.1.3 (latest as of April 2026). Bug is present in all released versions.
+
 ### Applying Patches
 
 Patch files are stored in `patches/` and can be applied (or re-applied after a `pip upgrade`) with:
@@ -243,8 +256,8 @@ The script detects the vsrvrt install location automatically, skips already-appl
 
 ## Basic Usage 
 
-### In a .vpy Script
-Once installed, you can call the restoration functions directly in your script. Note that VRT is highly resource-intensive; using FP16 mode is recommended to reduce VRAM usage by 50%
+### vpy scripts
+Once vsrvrt is installed, you can call the restoration functions directly in your script. Note that VRT is highly resource-intensive; using FP16 mode is recommended to reduce VRAM usage by 50%
 
 ```
 import vapoursynth as vs
@@ -266,7 +279,7 @@ Performance Optimization
   - Memory Management: If you encounter Out of Memory (OOM) errors, decrease the tile_size or chunk_size in the function arguments.
   - Precision: Use fp16=True for a roughly 2x speedup on compatible hardware
 
-How to Use the Weights
+How ot use PyTorch Models and Weights
 
 The plugin uses these weights by loading them into the RVRT neural network architecture during script execution. Depending on the specific implementation (like vs-rvrt), they are handled in one of two ways:
 
@@ -319,17 +332,21 @@ clip.set_output()
 
 ### vpy-toolkit
 
-The toolkit is a collection of Python CLI runners and VapourSynth `.vpy` scripts for end-to-end video restoration workflows. Each runner handles the full pipeline: source analysis → VapourSynth processing → FIFO pipe → ffmpeg encoding, with graceful Ctrl+C cleanup.
+If you're new to VapourSynth, vspipe is a streaming processor that you program using `.vpy`
+sripts.  The script opens a video stream and provides VapourSynth processing logic as
+frames stream in. The output is the processed video stream of frames.
 
-All pipelines output MKV containers and default to FFV1 lossless encoding. GPU (NVENC) and CPU HEVC encoding options are available.
+My toolkit is a collection of Python CLI runners and VapourSynth `.vpy` scripts for end-to-end video restoration workflows. Each runner handles the full pipeline: source analysis → VapourSynth processing → FIFO pipe → ffmpeg encoding, with graceful Ctrl-C interupt handling.
+
+All pipelines output MKV containers defaulting to FFV1 lossless encoding. GPU (NVENC) and CPU HEVC encoding options are also available.
 
 #### Tools
 
 | Script | VapourSynth Script | Purpose |
 |--------|-------------------|---------|
-| `run_deti2p.py` | `deti2p.vpy` | Detelecine (IVTC) and deinterlace to progressive |
+| `run_deti2p.py` | `deti2p.vpy` | Detelecine (IVTC/TIVTC) and deinterlace (NNEDI3) to progressive |
 | `run_motion_deblur.py` | `motion_deblur.vpy` | GoPro-trained VRT motion deblur |
-| `run_fps_interpolate.py` | `fps_interpolate.vpy` | RIFE frame rate interpolation with scene-cut detection |
+| `run_fps_interpolate.py` | `fps_interpolate.vpy` | RIFE/VSR frame rate interpolation with scene-cut detection |
 | `detect_tip.py` | — | Standalone TIP detector (telecine / interlace / progressive) |
 
 #### Detelecine / Deinterlace (`run_deti2p.py`)
@@ -340,14 +357,14 @@ Auto-detects whether the source is telecined (3:2 pulldown), interlaced, or prog
 # Auto-detect and process with FFV1 lossless output
 python run_deti2p.py -i input.mp4
 
-# Analyze only — detect telecine/interlace, no output file
+# Analyze only — detect hard/soft telecine/interlace, no output file
 python run_deti2p.py -i input.mp4 --analyze
 
 # Force deinterlace with BFF field order
 python run_deti2p.py -i input.mp4 --mode deinterlace --field-order bff
 
 # Upscale 2x with custom ESRGAN weights, CPU HEVC encoding
-python run_deti2p.py -i input.mp4 --upscale esrgan --esrgan-model weights.pth --cpu-hevc --cq 20
+python run_deti2p.py -i input.mp4 --upscale esrgan --esrgan-model weights.pth --cpu-hevc --cq 20 --dar copy
 
 # Upscale 4x with VRT/RVRT VSR
 python run_deti2p.py -i input.mp4 --upscale vsr --cpu-hevc --cq 18 --x265-preset slow
@@ -381,7 +398,7 @@ python run_fps_interpolate.py -i input.mp4 --factor 4
 
 #### TIP Detector (`detect_tip.py`)
 
-Standalone source analysis tool. Splits the video into scenes, runs ffmpeg's `idet` filter on each, and reports a duration-weighted verdict: telecine (hard or soft), interlaced (TFF/BFF), or progressive.
+Standalone video analysis tool. Analyze the video by scenes, runs ffmpeg's `idet` filter on each, and reports a duration-weighted verdict: telecine (hard or soft), interlaced (TFF/BFF), or progressive.
 
 ```bash
 python detect_tip.py -i input.mp4
