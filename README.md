@@ -332,6 +332,14 @@ clip.set_output()
 
 ### vpy-toolkit
 
+#### Quick Setup
+
+```bash
+git clone https://github.com/kyng-codeops/VRT.git
+cd VRT
+./setup.sh    # Installs git hooks and checks dependencies
+```
+
 If you're new to VapourSynth, vspipe is a streaming processor that you program using `.vpy`
 sripts.  The script opens a video stream and provides VapourSynth processing logic as
 frames stream in. The output is the processed video stream of frames.
