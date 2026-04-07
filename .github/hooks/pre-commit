@@ -1,0 +1,17 @@
+#!/bin/bash
+# Prevent direct edits to shared files on feature branches
+
+BRANCH=$(git branch --show-current)
+PROTECTED_PATHS="models/ utils/"
+
+# Only check feature branches
+if [[ $BRANCH == feature/* ]]; then
+    for path in $PROTECTED_PATHS; do
+        if git diff --cached --name-only | grep -q "^${path}"; then
+            echo "ERROR: Editing $path on feature branch '$BRANCH'"
+            echo "       Edit on vpy-toolkit, then merge to feature branch."
+            echo "       To bypass: git commit --no-verify"
+            exit 1
+        fi
+    done
+fi

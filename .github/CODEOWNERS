@@ -1,0 +1,4 @@
+# Shared infrastructure requires maintainer review
+/models/         @your-github-username
+/utils/          @your-github-username
+/patches/        @your-github-username
