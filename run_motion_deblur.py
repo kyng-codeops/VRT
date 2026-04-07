@@ -37,7 +37,28 @@ def get_framerate(input_path: str) -> str:
         return f"{rate.numerator}/{rate.denominator}"
 
 
-def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args):
+def get_sar(input_path: str) -> tuple[int, int]:
+    """Get sample aspect ratio (SAR) from input video as (num, den).
+
+    Returns (1, 1) for square pixels or if SAR is not set.
+    """
+    with av.open(input_path) as container:
+        stream = container.streams.video[0]
+        sar = stream.sample_aspect_ratio
+        if sar is None or sar == 0:
+            return 1, 1
+        return sar.numerator, sar.denominator
+
+
+def get_resolution(input_path: str) -> tuple[int, int]:
+    """Get width and height from input video."""
+    with av.open(input_path) as container:
+        stream = container.streams.video[0]
+        return stream.width, stream.height
+
+
+def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args,
+                     sar_num=1, sar_den=1):
     """Build the ffmpeg command based on encoding mode."""
     cmd = [
         "ffmpeg", "-hide_banner", "-stats",
@@ -89,6 +110,11 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args):
         ]
         print("Encoding: FFV1 lossless (CPU, 12 slices/threads)")
 
+    # For --dar copy, embed SAR metadata so players display correct aspect ratio
+    if args.dar == "copy" and (sar_num != 1 or sar_den != 1):
+        cmd += ["-vf", f"setsar={sar_num}/{sar_den}"]
+        print(f"DAR:       copy SAR {sar_num}:{sar_den} to output")
+
     cmd += ["-c:a", "copy", "-shortest", output_path, "-y"]
     return cmd
 
@@ -125,6 +151,12 @@ def parse_args():
                           help="Upscale after deblurring (default: none)")
     up_group.add_argument("--esrgan-model", default="",
                           help="Path to ESRGAN .pth model (required for --upscale esrgan)")
+    up_group.add_argument("--dar", default="none",
+                          choices=["none", "copy", "correct"],
+                          help="Display aspect ratio handling (default: none).\n"
+                          "  none:    ignore source DAR\n"
+                          "  copy:    copy source SAR metadata to output\n"
+                          "  correct: resize to square pixels")
     return parser.parse_args()
 
 
@@ -151,9 +183,15 @@ def main():
     # chdir to script dir so vspipe can find the .vpy
     os.chdir(script_dir)
 
-    # Detect framerate
+    # Detect framerate and resolution
     fps = get_framerate(input_path)
+    src_w, src_h = get_resolution(input_path)
+    sar_num, sar_den = get_sar(input_path)
+    sar_is_nonsquare = (sar_num != sar_den)
+    sar_str = f" SAR {sar_num}:{sar_den}" if sar_is_nonsquare else ""
+
     print(f"Input:     {input_path}")
+    print(f"Source:    {src_w}x{src_h}{sar_str}")
     print(f"Output:    {output_path}")
     num, den = fps.split("/")
     print(f"Framerate: {fps} ({int(num)/int(den):.4f} fps)")
@@ -208,8 +246,17 @@ def main():
             sys.exit(f"ERROR: ESRGAN model not found: {esrgan_model_path}")
         env["VRT_ESRGAN_MODEL"] = esrgan_model_path
 
+    # Pass DAR correction info to .vpy for --dar correct
+    if args.dar == "correct" and sar_is_nonsquare:
+        env["VRT_DAR_CORRECT"] = "1"
+        env["VRT_SAR_NUM"] = str(sar_num)
+        env["VRT_SAR_DEN"] = str(sar_den)
+
     try:
-        ffmpeg_cmd = build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args)
+        ffmpeg_cmd = build_ffmpeg_cmd(
+            fifo_path, input_path, output_path, fps, args,
+            sar_num=sar_num, sar_den=sar_den
+        )
         ffmpeg_proc = subprocess.Popen(ffmpeg_cmd)
 
         vspipe_proc = subprocess.Popen([

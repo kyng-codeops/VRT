@@ -79,7 +79,7 @@ if upscale_mode == "esrgan":
         raise vs.Error(f"VRT_ESRGAN_MODEL not set or file not found: {esrgan_model}")
 
     def load_esrgan_model(model_path, device):
-        \"\"\"Load a Real-ESRGAN .pth state dict and infer architecture.\"\"\"
+        """Load a Real-ESRGAN .pth state dict and infer architecture."""
         state_dict = torch.load(model_path, map_location=device, weights_only=False)
         if "params_ema" in state_dict:
             state_dict = state_dict["params_ema"]
@@ -134,7 +134,7 @@ if upscale_mode == "esrgan":
     _max_cached_chunks = 3
 
     def _process_chunk(chunk_idx):
-        \"\"\"Process all frames in a chunk and cache results.\"\"\"
+        """Process all frames in a chunk and cache results."""
         start = chunk_idx * _chunk_size
         end = min(start + _chunk_size, total_frames)
         nf = _num_input_frames
@@ -168,7 +168,7 @@ if upscale_mode == "esrgan":
     blank = core.std.BlankClip(clip_rgb, width=out_w, height=out_h)
 
     def esrgan_process(n, f):
-        \"\"\"Serve frame from chunk cache; process chunk if not cached.\"\"\"
+        """Serve frame from chunk cache; process chunk if not cached."""
         chunk_idx = n // _chunk_size
 
         if chunk_idx not in _chunk_cache:
@@ -186,6 +186,23 @@ if upscale_mode == "esrgan":
         return out_frame
 
     result = core.std.ModifyFrame(blank, clips=[blank], selector=esrgan_process)
+
+# ---------------------------------------------------------------------------
+# DAR correction — resize to square pixels (--dar correct)
+# ---------------------------------------------------------------------------
+if os.environ.get("VRT_DAR_CORRECT") == "1":
+    sar_num = int(os.environ.get("VRT_SAR_NUM", "1"))
+    sar_den = int(os.environ.get("VRT_SAR_DEN", "1"))
+    if sar_num != sar_den:
+        sar = sar_num / sar_den
+        if sar > 1:
+            # Wide pixels: shrink height to match
+            new_h = int(round(result.height / sar / 2)) * 2
+            result = core.resize.Lanczos(result, width=result.width, height=new_h)
+        else:
+            # Tall pixels: shrink width to match
+            new_w = int(round(result.width * sar / 2)) * 2
+            result = core.resize.Lanczos(result, width=new_w, height=result.height)
 
 # Convert back to YUV for y4m output (444 to match FFV1 lossless output)
 result = core.resize.Bicubic(result, format=vs.YUV444P10, matrix_s="470bg")
