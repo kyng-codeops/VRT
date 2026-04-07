@@ -10,6 +10,7 @@ Usage:
     python run_motion_deblur.py -i input.mp4 --gpu             # NVENC HEVC encoding
     python run_motion_deblur.py -i input.mp4 --gpu --encoder hevc_nvenc --cq 18
     python run_motion_deblur.py -i input.mp4 --gpu-lossless    # NVENC lossless 444 10-bit
+    python run_motion_deblur.py -i input.mp4 --cpu-hevc --cq 20 --x265-preset slow
     python run_motion_deblur.py -i input.mp4 --upscale esrgan --esrgan-model weights.pth
 """
 
@@ -51,7 +52,7 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args):
             # AV1 NVENC for true lossless 444 10-bit
             cmd += [
                 "-c:v", "av1_nvenc",
-                "-preset", "p1",     # fastest (lossless output is identical at any preset)
+                "-preset", "p1",
                 "-tune", "lossless",
                 "-rc", "constqp",
                 "-qp", "0",
@@ -63,7 +64,7 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args):
             encoder = args.encoder
             cmd += [
                 "-c:v", encoder,
-                "-preset", "p7",     # slowest NVENC preset = best quality
+                "-preset", "p7",
                 "-tune", "hq",
                 "-rc", "constqp",
                 "-qp", str(args.cq),
@@ -71,6 +72,15 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args):
                 "-pix_fmt", "yuv444p10le",
             ]
             print(f"Encoding: {encoder} (GPU), QP={args.cq}")
+    elif args.cpu_hevc:
+        cmd += [
+            "-c:v", "libx265",
+            "-preset", args.x265_preset,
+            "-crf", str(args.cq),
+            "-pix_fmt", "yuv444p10le",
+        ]
+        print(f"Encoding: libx265 (CPU), preset={args.x265_preset}, "
+              f"CRF={args.cq}, 444 10-bit")
     else:
         cmd += [
             "-c:v", "ffv1", "-level", "3", "-slicecrc", "1",
@@ -94,18 +104,20 @@ def parse_args():
     parser.add_argument("-cr", "--cframes", type=int, default=4,
                         help="vspipe concurrent frame requests (default: 4)")
     parser.add_argument("--gpu-lossless", action="store_true",
-                        help="NVENC GPU lossless encoding (444 10-bit, good for intermediates)")
+                        help="NVENC GPU lossless encoding (444 10-bit)")
     parser.add_argument("--gpu", action="store_true",
-                        help="Use custom NVENC GPU encoding instead of gpu-lossless or FFV1 CPU.\n" \
-                        "Cannot be used with --gpu-lossless; if both are set, --gpu-lossless\n" \
-                        "takes precedence.")
+                        help="NVENC GPU lossy encoding")
+    parser.add_argument("--cpu-hevc", action="store_true",
+                        help="CPU libx265 HEVC encoding (444 10-bit)")
+    parser.add_argument("--x265-preset", default="medium",
+                        choices=["ultrafast", "superfast", "veryfast", "faster",
+                                 "fast", "medium", "slow", "slower", "veryslow"],
+                        help="libx265 preset (default: medium)")
     parser.add_argument("--encoder", default="hevc_nvenc",
                         choices=["hevc_nvenc", "av1_nvenc"],
-                        help="NVENC encoder to use with --gpu (default: hevc_nvenc).\n"
-                        "Requires --gpu and is ignored if --gpu-lossless is set.")
+                        help="NVENC encoder for --gpu (default: hevc_nvenc)")
     parser.add_argument("--cq", type=int, default=18,
-                        help="Constant QP for NVENC (lower=better, default: 18).\n"
-                        "Requires --gpu and is ignored if --gpu-lossless is set.")
+                        help="Quality value: CRF for --cpu-hevc, QP for --gpu")
 
     # Upscaling options
     up_group = parser.add_argument_group("Upscaling")
