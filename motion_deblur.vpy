@@ -1,6 +1,12 @@
 import vapoursynth as vs
 import os
+import sys
 from vsrvrt import Deblur
+
+# Add script directory to path for local imports (models.network_rrdbnet)
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
 
 core = vs.core
 core.max_cache_size = 2048  # Limit VS frame cache to 2GB RAM
