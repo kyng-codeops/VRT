@@ -10,6 +10,8 @@ Usage:
     python run_motion_deblur.py -i input.mp4 --gpu             # NVENC HEVC encoding
     python run_motion_deblur.py -i input.mp4 --gpu --encoder hevc_nvenc --cq 18
     python run_motion_deblur.py -i input.mp4 --gpu-lossless    # NVENC lossless 444 10-bit
+    python run_motion_deblur.py -i input.mp4 --cpu-hevc --cq 20 --x265-preset slow
+    python run_motion_deblur.py -i input.mp4 --upscale esrgan --esrgan-model weights.pth
 """
 
 import argparse
@@ -35,7 +37,28 @@ def get_framerate(input_path: str) -> str:
         return f"{rate.numerator}/{rate.denominator}"
 
 
-def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args):
+def get_sar(input_path: str) -> tuple[int, int]:
+    """Get sample aspect ratio (SAR) from input video as (num, den).
+
+    Returns (1, 1) for square pixels or if SAR is not set.
+    """
+    with av.open(input_path) as container:
+        stream = container.streams.video[0]
+        sar = stream.sample_aspect_ratio
+        if sar is None or sar == 0:
+            return 1, 1
+        return sar.numerator, sar.denominator
+
+
+def get_resolution(input_path: str) -> tuple[int, int]:
+    """Get width and height from input video."""
+    with av.open(input_path) as container:
+        stream = container.streams.video[0]
+        return stream.width, stream.height
+
+
+def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args,
+                     sar_num=1, sar_den=1):
     """Build the ffmpeg command based on encoding mode."""
     cmd = [
         "ffmpeg", "-hide_banner", "-stats",
@@ -50,7 +73,7 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args):
             # AV1 NVENC for true lossless 444 10-bit
             cmd += [
                 "-c:v", "av1_nvenc",
-                "-preset", "p1",     # fastest (lossless output is identical at any preset)
+                "-preset", "p1",
                 "-tune", "lossless",
                 "-rc", "constqp",
                 "-qp", "0",
@@ -62,7 +85,7 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args):
             encoder = args.encoder
             cmd += [
                 "-c:v", encoder,
-                "-preset", "p7",     # slowest NVENC preset = best quality
+                "-preset", "p7",
                 "-tune", "hq",
                 "-rc", "constqp",
                 "-qp", str(args.cq),
@@ -70,6 +93,15 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args):
                 "-pix_fmt", "yuv444p10le",
             ]
             print(f"Encoding: {encoder} (GPU), QP={args.cq}")
+    elif args.cpu_hevc:
+        cmd += [
+            "-c:v", "libx265",
+            "-preset", args.x265_preset,
+            "-crf", str(args.cq),
+            "-pix_fmt", "yuv444p10le",
+        ]
+        print(f"Encoding: libx265 (CPU), preset={args.x265_preset}, "
+              f"CRF={args.cq}, 444 10-bit")
     else:
         cmd += [
             "-c:v", "ffv1", "-level", "3", "-slicecrc", "1",
@@ -77,6 +109,11 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args):
             "-pix_fmt", "yuv444p10le",
         ]
         print("Encoding: FFV1 lossless (CPU, 12 slices/threads)")
+
+    # For --dar copy, embed SAR metadata so players display correct aspect ratio
+    if args.dar == "copy" and (sar_num != 1 or sar_den != 1):
+        cmd += ["-vf", f"setsar={sar_num}/{sar_den}"]
+        print(f"DAR:       copy SAR {sar_num}:{sar_den} to output")
 
     cmd += ["-c:a", "copy", "-shortest", output_path, "-y"]
     return cmd
@@ -93,23 +130,42 @@ def parse_args():
     parser.add_argument("-cr", "--cframes", type=int, default=4,
                         help="vspipe concurrent frame requests (default: 4)")
     parser.add_argument("--gpu-lossless", action="store_true",
-                        help="NVENC GPU lossless encoding (444 10-bit, good for intermediates)")
+                        help="NVENC GPU lossless encoding (444 10-bit)")
     parser.add_argument("--gpu", action="store_true",
-                        help="Use custom NVENC GPU encoding instead of gpu-lossless or FFV1 CPU.\n" \
-                        "Cannot be used with --gpu-lossless; if both are set, --gpu-lossless\n" \
-                        "takes precedence.")
+                        help="NVENC GPU lossy encoding")
+    parser.add_argument("--cpu-hevc", action="store_true",
+                        help="CPU libx265 HEVC encoding (444 10-bit)")
+    parser.add_argument("--x265-preset", default="medium",
+                        choices=["ultrafast", "superfast", "veryfast", "faster",
+                                 "fast", "medium", "slow", "slower", "veryslow"],
+                        help="libx265 preset (default: medium)")
     parser.add_argument("--encoder", default="hevc_nvenc",
                         choices=["hevc_nvenc", "av1_nvenc"],
-                        help="NVENC encoder to use with --gpu (default: hevc_nvenc).\n"
-                        "Requires --gpu and is ignored if --gpu-lossless is set.")
+                        help="NVENC encoder for --gpu (default: hevc_nvenc)")
     parser.add_argument("--cq", type=int, default=18,
-                        help="Constant QP for NVENC (lower=better, default: 18).\n"
-                        "Requires --gpu and is ignored if --gpu-lossless is set.")
+                        help="Quality value: CRF for --cpu-hevc, QP for --gpu")
+
+    # Upscaling options
+    up_group = parser.add_argument_group("Upscaling")
+    up_group.add_argument("--upscale", choices=["none", "esrgan"], default="none",
+                          help="Upscale after deblurring (default: none)")
+    up_group.add_argument("--esrgan-model", default="",
+                          help="Path to ESRGAN .pth model (required for --upscale esrgan)")
+    up_group.add_argument("--dar", default="none",
+                          choices=["none", "copy", "correct"],
+                          help="Display aspect ratio handling (default: none).\n"
+                          "  none:    ignore source DAR\n"
+                          "  copy:    copy source SAR metadata to output\n"
+                          "  correct: resize to square pixels")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # Validate upscale options
+    if args.upscale == "esrgan" and not args.esrgan_model:
+        sys.exit("ERROR: --esrgan-model is required when --upscale esrgan is used")
 
     script_dir = Path(__file__).resolve().parent
 
@@ -127,9 +183,15 @@ def main():
     # chdir to script dir so vspipe can find the .vpy
     os.chdir(script_dir)
 
-    # Detect framerate
+    # Detect framerate and resolution
     fps = get_framerate(input_path)
+    src_w, src_h = get_resolution(input_path)
+    sar_num, sar_den = get_sar(input_path)
+    sar_is_nonsquare = (sar_num != sar_den)
+    sar_str = f" SAR {sar_num}:{sar_den}" if sar_is_nonsquare else ""
+
     print(f"Input:     {input_path}")
+    print(f"Source:    {src_w}x{src_h}{sar_str}")
     print(f"Output:    {output_path}")
     num, den = fps.split("/")
     print(f"Framerate: {fps} ({int(num)/int(den):.4f} fps)")
@@ -177,9 +239,24 @@ def main():
     # Pass input file to .vpy via environment variable
     env = os.environ.copy()
     env["VRT_INPUT"] = input_path
+    env["VRT_UPSCALE"] = args.upscale
+    if args.esrgan_model:
+        esrgan_model_path = str(Path(args.esrgan_model).resolve())
+        if not Path(esrgan_model_path).is_file():
+            sys.exit(f"ERROR: ESRGAN model not found: {esrgan_model_path}")
+        env["VRT_ESRGAN_MODEL"] = esrgan_model_path
+
+    # Pass DAR correction info to .vpy for --dar correct
+    if args.dar == "correct" and sar_is_nonsquare:
+        env["VRT_DAR_CORRECT"] = "1"
+        env["VRT_SAR_NUM"] = str(sar_num)
+        env["VRT_SAR_DEN"] = str(sar_den)
 
     try:
-        ffmpeg_cmd = build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args)
+        ffmpeg_cmd = build_ffmpeg_cmd(
+            fifo_path, input_path, output_path, fps, args,
+            sar_num=sar_num, sar_den=sar_den
+        )
         ffmpeg_proc = subprocess.Popen(ffmpeg_cmd)
 
         vspipe_proc = subprocess.Popen([
