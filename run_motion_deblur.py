@@ -98,10 +98,10 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args,
             "-c:v", "libx265",
             "-preset", args.x265_preset,
             "-crf", str(args.cq),
-            "-pix_fmt", "yuv444p10le",
+            "-pix_fmt", "yuv420p10le",
         ]
         print(f"Encoding: libx265 (CPU), preset={args.x265_preset}, "
-              f"CRF={args.cq}, 444 10-bit")
+              f"CRF={args.cq}, 420 10-bit")
     else:
         cmd += [
             "-c:v", "ffv1", "-level", "3", "-slicecrc", "1",
@@ -134,7 +134,7 @@ def parse_args():
     parser.add_argument("--gpu", action="store_true",
                         help="NVENC GPU lossy encoding")
     parser.add_argument("--cpu-hevc", action="store_true",
-                        help="CPU libx265 HEVC encoding (444 10-bit)")
+                        help="CPU libx265 HEVC encoding (420 10-bit, compatible)")
     parser.add_argument("--x265-preset", default="medium",
                         choices=["ultrafast", "superfast", "veryfast", "faster",
                                  "fast", "medium", "slow", "slower", "veryslow"],
