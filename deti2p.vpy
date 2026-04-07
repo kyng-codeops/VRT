@@ -191,22 +191,13 @@ else:
 
     elif upscale_mode == "esrgan":
         # Real-ESRGAN single-image super-resolution via custom .pth weights
-        # This uses torch directly — load model, process frame-by-frame
+        # Uses chunk-based processing with caching to avoid VS deadlocks.
+        # (Same approach as vsrvrt's preview_mode)
         import torch
         import numpy as np
-        import threading
-
-        # Serialize GPU access — VapourSynth calls ModifyFrame from multiple
-        # threads but CUDA inference must be single-threaded to avoid OOM /
-        # deadlocks from concurrent kernel launches.
-        _esrgan_lock = threading.Lock()
 
         if not esrgan_model or not os.path.isfile(esrgan_model):
             raise vs.Error(f"VRT_ESRGAN_MODEL not set or file not found: {esrgan_model}")
-
-        # Lazy-load the model on first frame
-        _esrgan_net = [None]
-        _esrgan_scale = [4]  # will be detected from model
 
         def load_esrgan_model(model_path, device):
             """Load a Real-ESRGAN .pth state dict and infer architecture."""
@@ -216,29 +207,19 @@ else:
             elif "params" in state_dict:
                 state_dict = state_dict["params"]
 
-            # Detect RRDBNet architecture from state dict keys
-            # Standard RRDBNet: conv_first, body.{0..N}.rdb{1,2,3}, conv_body,
-            #   conv_up1, conv_up2, [conv_up3], conv_hr, conv_last
             from models.network_rrdbnet import RRDBNet
 
-            # Infer num_block from body keys
             body_keys = [k for k in state_dict if k.startswith("body.") and ".rdb" in k]
             if body_keys:
                 block_nums = set(int(k.split(".")[1]) for k in body_keys)
                 num_block = max(block_nums) + 1
             else:
-                num_block = 23  # default
+                num_block = 23
 
-            # Infer scale: basicsr RRDBNet always has conv_up1+conv_up2.
-            # Scale is determined by pixel_unshuffle on input:
-            #   scale=2: conv_first expects in_ch*4 (pixel_unshuffle by 2)
-            #   scale=1: conv_first expects in_ch*16 (pixel_unshuffle by 4)
-            #   scale=4: conv_first expects in_ch (no pixel_unshuffle)
             conv_first_ch = state_dict["conv_first.weight"].shape[1]
             out_nc = state_dict["conv_last.weight"].shape[0]
             num_feat = state_dict["conv_first.weight"].shape[0]
 
-            # out_nc is the real channel count (3 for RGB)
             if conv_first_ch == out_nc * 4:
                 scale = 2
                 in_nc = out_nc
@@ -254,84 +235,87 @@ else:
                             scale=scale)
             model.load_state_dict(state_dict, strict=True)
             model.eval().to(device)
-            return model, scale
-
-        def esrgan_process(n, f):
-            """Frame-by-frame ESRGAN processing callback."""
-            with _esrgan_lock:
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                if _esrgan_net[0] is None:
-                    _esrgan_net[0], _esrgan_scale[0] = load_esrgan_model(esrgan_model, device)
-
-                model = _esrgan_net[0]
-                nf = _num_input_frames
-
-                if nf > 1:
-                    # Multi-frame model: stack nf frames centered on current frame
-                    frames_rgb = []
-                    half = nf // 2
-                    for offset in range(-half, -half + nf):
-                        idx = min(max(n + offset, 0), clip_rgb.num_frames - 1)
-                        fr = clip_rgb.get_frame(idx)
-                        planes = [np.asarray(fr[p]) for p in range(3)]
-                        frames_rgb.append(np.stack(planes, axis=0))
-                    img = np.concatenate(frames_rgb, axis=0)  # [nf*3, H, W]
-                else:
-                    # Single-frame model: just use f directly
-                    planes = [np.asarray(f[p]) for p in range(f.format.num_planes)]
-                    img = np.stack(planes, axis=0)  # [3, H, W]
-
-                tensor = torch.from_numpy(img).unsqueeze(0).to(device)
-
-                with torch.no_grad():
-                    output = model(tensor)
-
-                output = output.squeeze(0).clamp(0, 1).cpu().numpy()
-                del tensor
-                if device.type == "cuda" and n % 100 == 0:
-                    torch.cuda.empty_cache()
-
-                # Return a frame matching the output clip (blank) dimensions
-                out_frame = blank.get_frame(n).copy()
-                for p in range(3):
-                    np.copyto(np.asarray(out_frame[p]), output[p])
-                return out_frame
+            return model, scale, out_nc
 
         # Convert to RGBS for ESRGAN
         clip_rgb = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s="470bg")
 
-        # We need to create the output clip with the correct dimensions
-        # Use a blank clip at the target size as template
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        test_state = torch.load(esrgan_model, map_location="cpu", weights_only=False)
-        if "params_ema" in test_state:
-            test_state = test_state["params_ema"]
-        elif "params" in test_state:
-            test_state = test_state["params"]
-        # Detect scale and input channels from weights
-        conv_first_ch = test_state["conv_first.weight"].shape[1]
-        out_nc = test_state["conv_last.weight"].shape[0]
-        if conv_first_ch == out_nc * 4:
-            sr_scale = 2
-        elif conv_first_ch == out_nc * 16:
-            sr_scale = 1
-        else:
-            sr_scale = 4
-
-        _in_nc = out_nc  # actual input channels (before pixel_unshuffle)
-        _num_input_frames = _in_nc // 3  # e.g. 12 actual = 4 frames × 3 RGB
-        del test_state
+        # Load model eagerly
+        _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        _model, sr_scale, _out_nc = load_esrgan_model(esrgan_model, _device)
+        _num_input_frames = _out_nc // 3
 
         out_w = clip_rgb.width * sr_scale
         out_h = clip_rgb.height * sr_scale
+        total_frames = clip_rgb.num_frames
 
+        # Chunk-based caching (like vsrvrt preview_mode)
+        # Process frames in chunks; cache results to avoid repeated get_frame calls
+        _chunk_size = 64
+        _chunk_cache = {}  # chunk_idx -> list of numpy arrays
+        _max_cached_chunks = 3  # Keep only recent chunks in memory
+
+        def _process_chunk(chunk_idx):
+            """Process all frames in a chunk and cache results."""
+            start = chunk_idx * _chunk_size
+            end = min(start + _chunk_size, total_frames)
+            nf = _num_input_frames
+            half = nf // 2 if nf > 1 else 0
+
+            results = []
+            for n in range(start, end):
+                # Build input for this frame
+                if nf > 1:
+                    frames_rgb = []
+                    for offset in range(-half, -half + nf):
+                        idx = min(max(n + offset, 0), total_frames - 1)
+                        fr = clip_rgb.get_frame(idx)
+                        planes = [np.asarray(fr[p]).copy() for p in range(3)]
+                        frames_rgb.append(np.stack(planes, axis=0))
+                    img = np.concatenate(frames_rgb, axis=0)
+                else:
+                    fr = clip_rgb.get_frame(n)
+                    planes = [np.asarray(fr[p]).copy() for p in range(3)]
+                    img = np.stack(planes, axis=0)
+
+                # Run inference
+                tensor = torch.from_numpy(img).unsqueeze(0).to(_device)
+                with torch.no_grad():
+                    output = _model(tensor)
+                output_np = output.squeeze(0).clamp(0, 1).cpu().numpy()
+                results.append(output_np)
+                del tensor
+
+            torch.cuda.empty_cache()
+            return results
+
+        # Create blank output template
         blank = core.std.BlankClip(clip_rgb, width=out_w, height=out_h)
-        clip = core.std.ModifyFrame(blank, clips=[clip_rgb], selector=esrgan_process)
 
-        # Limit VapourSynth threads — GPU inference is single-threaded via lock,
-        # extra threads just queue frames that consume RAM while waiting.
-        core.num_threads = 2
-        core.max_cache_size = 1024  # 1GB is plenty for serial GPU processing
+        def esrgan_process(n, f):
+            """Serve frame from chunk cache; process chunk if not cached."""
+            chunk_idx = n // _chunk_size
+
+            # Process chunk if not in cache
+            if chunk_idx not in _chunk_cache:
+                _chunk_cache[chunk_idx] = _process_chunk(chunk_idx)
+
+                # Evict old chunks to bound memory
+                if len(_chunk_cache) > _max_cached_chunks:
+                    oldest = min(k for k in _chunk_cache if k != chunk_idx)
+                    del _chunk_cache[oldest]
+
+            # Get frame from cache
+            frame_in_chunk = n - (chunk_idx * _chunk_size)
+            output_np = _chunk_cache[chunk_idx][frame_in_chunk]
+
+            # Build output frame - f is the blank frame passed by VS
+            out_frame = f.copy()
+            for p in range(3):
+                np.copyto(np.asarray(out_frame[p]), output_np[p])
+            return out_frame
+
+        clip = core.std.ModifyFrame(blank, clips=[blank], selector=esrgan_process)
 
         # Back to YUV
         clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s="470bg")
