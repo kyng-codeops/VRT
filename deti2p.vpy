@@ -21,9 +21,36 @@ upscale_width = int(os.environ.get("VRT_WIDTH", "0"))
 upscale_height = int(os.environ.get("VRT_HEIGHT", "0"))
 
 # ---------------------------------------------------------------------------
+# Helper: auto-detect color matrix from frame props or resolution
+# ---------------------------------------------------------------------------
+def get_matrix(clip):
+    """Return the appropriate color matrix name for the clip.
+
+    Checks _Matrix frame property first (most reliable), then falls back
+    to resolution-based heuristics: HD (>=720p) uses BT.709, SD uses BT.601.
+    """
+    try:
+        props = clip.get_frame(0).props
+        matrix = props.get("_Matrix", None)
+        if matrix == 1:
+            return "709"
+        if matrix in (5, 6):  # 5=BT.470BG, 6=SMPTE 170M
+            return "470bg"
+        if matrix == 9:
+            return "2020ncl"
+    except Exception:
+        pass
+    # Fallback to resolution heuristic
+    if clip.width >= 1280 or clip.height >= 720:
+        return "709"
+    return "470bg"
+
+# ---------------------------------------------------------------------------
 # 1. Source
 # ---------------------------------------------------------------------------
 clip = core.ffms2.Source(input_file)
+_matrix = get_matrix(clip)  # Detect matrix from source before any processing
+
 src_fps_num = clip.fps.numerator
 src_fps_den = clip.fps.denominator
 src_fps = src_fps_num / src_fps_den
@@ -183,11 +210,11 @@ else:
         # VapourSynth RVRT video super-resolution (4x)
         from vsrvrt import SuperRes
         # Convert to RGBS for RVRT
-        clip = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s="470bg")
+        clip = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s=_matrix)
         clip = SuperRes(clip, model="reds", preview_mode=True,
                         chunk_overlap=24)
         # Back to YUV for output
-        clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s="470bg")
+        clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s=_matrix)
 
     elif upscale_mode == "esrgan":
         # Real-ESRGAN single-image super-resolution via custom .pth weights
@@ -238,7 +265,7 @@ else:
             return model, scale, out_nc
 
         # Convert to RGBS for ESRGAN
-        clip_rgb = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s="470bg")
+        clip_rgb = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s=_matrix)
 
         # Load model eagerly
         _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -318,16 +345,13 @@ else:
         clip = core.std.ModifyFrame(blank, clips=[blank], selector=esrgan_process)
 
         # Back to YUV
-        clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s="470bg")
+        clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s=_matrix)
 
     else:
         # No upscale — just ensure output is YUV444P10
         if clip.format.id != vs.YUV444P10:
-            matrix = "470bg"  # BT.601 for SD content
-            if clip.width >= 1280 or clip.height >= 720:
-                matrix = "709"
             if clip.format.color_family == vs.RGB:
-                clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s=matrix)
+                clip = core.resize.Bicubic(clip, format=vs.YUV444P10, matrix_s=_matrix)
             else:
                 clip = core.resize.Bicubic(clip, format=vs.YUV444P10)
 
