@@ -206,26 +206,26 @@ def main():
     vspipe_proc = None
 
     def cleanup(signum=None, frame=None):
-        """Stop subprocesses and remove FIFO on exit.
-
-        Kills vspipe first to stop frame production, then sends SIGINT
-        to ffmpeg so it finalizes the container (writes MKV trailer)
-        and produces a playable partial output file.
-        """
+        # Kill vspipe first (stop producing frames) then let ffmpeg finalize
         if vspipe_proc and vspipe_proc.poll() is None:
             print(f"\nKilling vspipe (pid {vspipe_proc.pid})...")
             vspipe_proc.kill()
-            vspipe_proc.wait()
-
+            try:
+                vspipe_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         if ffmpeg_proc and ffmpeg_proc.poll() is None:
             print(f"Stopping ffmpeg (pid {ffmpeg_proc.pid}), finalizing output...")
-            ffmpeg_proc.send_signal(signal.SIGINT)
             try:
-                ffmpeg_proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
+                ffmpeg_proc.send_signal(signal.SIGINT)
+                ffmpeg_proc.wait(timeout=10)
+            except (subprocess.TimeoutExpired, OSError):
+                print(f"Force-killing ffmpeg (pid {ffmpeg_proc.pid})...")
                 ffmpeg_proc.kill()
-                ffmpeg_proc.wait()
-
+                try:
+                    ffmpeg_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         try:
             os.unlink(fifo_path)
         except FileNotFoundError:
@@ -257,13 +257,15 @@ def main():
             fifo_path, input_path, output_path, fps, args,
             sar_num=sar_num, sar_den=sar_den
         )
-        ffmpeg_proc = subprocess.Popen(ffmpeg_cmd)
+        # start_new_session=True puts children in their own process group
+        # so terminal Ctrl+C only goes to Python, giving us full cleanup control
+        ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, start_new_session=True)
 
         vspipe_proc = subprocess.Popen([
             "vspipe", "-c", "y4m", "-p",
             VPY_SCRIPT, fifo_path,
             "-r", str(args.cframes),
-        ], env=env)
+        ], env=env, stderr=subprocess.PIPE, start_new_session=True)
 
         vspipe_proc.wait()
         vspipe_exit = vspipe_proc.returncode
@@ -271,7 +273,7 @@ def main():
         ffmpeg_proc.wait()
         ffmpeg_exit = ffmpeg_proc.returncode
 
-    except Exception:
+    except (Exception, SystemExit):
         cleanup()
         raise
 
