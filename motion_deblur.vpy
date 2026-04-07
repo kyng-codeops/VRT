@@ -19,11 +19,37 @@ if not input_file:
 upscale_mode = os.environ.get("VRT_UPSCALE", "none")  # none | esrgan
 esrgan_model = os.environ.get("VRT_ESRGAN_MODEL", "")
 
+# ---------------------------------------------------------------------------
+# Helper: auto-detect color matrix from frame props or resolution
+# ---------------------------------------------------------------------------
+def get_matrix(clip):
+    """Return the appropriate color matrix name for the clip.
+
+    Checks _Matrix frame property first (most reliable), then falls back
+    to resolution-based heuristics: HD (>=720p) uses BT.709, SD uses BT.601.
+    """
+    try:
+        props = clip.get_frame(0).props
+        matrix = props.get("_Matrix", None)
+        if matrix == 1:
+            return "709"
+        if matrix in (5, 6):  # 5=BT.470BG, 6=SMPTE 170M
+            return "470bg"
+        if matrix == 9:
+            return "2020ncl"
+    except Exception:
+        pass
+    # Fallback to resolution heuristic
+    if clip.width >= 1280 or clip.height >= 720:
+        return "709"
+    return "470bg"
+
 # Load your source
 clip = core.ffms2.Source(input_file)
+_matrix = get_matrix(clip)  # Detect matrix from source before any processing
 
-# Convert to RGB for Deblur (BT.601 for SD/DVD content)
-clip = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s="470bg")
+# Convert to RGB for Deblur
+clip = core.resize.Bicubic(clip, format=vs.RGBS, matrix_in_s=_matrix)
 
 # Remove blur using the GoPro deblurring model (general purpose)
 # tile_size: (temporal, height, width) — 0 means no tiling on that axis
@@ -39,7 +65,7 @@ deblurred = Deblur(clip, model="gopro", use_fp16=True,
 # to avoid removing intentional depth-of-field / background blur.
 
 # Work in GRAY for motion detection (luma channel from YUV)
-gray = core.resize.Bicubic(clip, format=vs.GRAY8, matrix_s="470bg")
+gray = core.resize.Bicubic(clip, format=vs.GRAY8, matrix_s=_matrix)
 
 # Inter-frame difference as a motion proxy
 prev_frame = core.std.DuplicateFrames(gray, [0])           # shift forward by 1
@@ -211,13 +237,13 @@ if os.environ.get("VRT_DAR_CORRECT") == "1":
             result = core.resize.Lanczos(result, width=new_w, height=result.height)
 
 # Convert back to YUV for y4m output (444 to match FFV1 lossless output)
-result = core.resize.Bicubic(result, format=vs.YUV444P10, matrix_s="470bg")
+result = core.resize.Bicubic(result, format=vs.YUV444P10, matrix_s=_matrix)
 
 result.set_output()
 
 # To disable the motion mask and apply deblurring uniformly to all areas,
 # replace the "result" lines above with:
-#   result = core.resize.Bicubic(deblurred, format=vs.YUV444P10, matrix_s="470bg")
+#   result = core.resize.Bicubic(deblurred, format=vs.YUV444P10, matrix_s=_matrix)
 #   result.set_output()
 # The motion mask code (lines 26-58) can be left in place — it will be
 # optimized away by VapourSynth since nothing references its output.
