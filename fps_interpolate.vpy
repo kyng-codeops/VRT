@@ -71,6 +71,23 @@ interpolated = rife(clip, model="4.25", factor_num=factor, factor_den=1,
 #   interpolated = rife(clip, model="4.25.heavy", ...)
 
 # Convert back to YUV for y4m output (444 10-bit to match FFV1 lossless output)
-interpolated = core.resize.Bicubic(interpolated, format=vs.YUV444P10, matrix_s=_matrix)
+result = core.resize.Bicubic(interpolated, format=vs.YUV444P10, matrix_s=_matrix)
 
-interpolated.set_output()
+# ---------------------------------------------------------------------------
+# DAR correction — resize to square pixels (--dar correct)
+# ---------------------------------------------------------------------------
+if os.environ.get("VRT_DAR_CORRECT") == "1":
+    sar_num = int(os.environ.get("VRT_SAR_NUM", "1"))
+    sar_den = int(os.environ.get("VRT_SAR_DEN", "1"))
+    if sar_num != sar_den:
+        sar = sar_num / sar_den
+        if sar > 1:
+            # Wide pixels: shrink height to match
+            new_h = int(round(result.height / sar / 2)) * 2
+            result = core.resize.Lanczos(result, width=result.width, height=new_h)
+        else:
+            # Tall pixels: shrink width to match
+            new_w = int(round(result.width * sar / 2)) * 2
+            result = core.resize.Lanczos(result, width=new_w, height=result.height)
+
+result.set_output()

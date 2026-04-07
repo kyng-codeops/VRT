@@ -9,8 +9,8 @@ Usage:
     python run_fps_interpolate.py -i input.mp4                   # FFV1 lossless (CPU)
     python run_fps_interpolate.py -i input.mp4 -o out            # custom output prefix
     python run_fps_interpolate.py -i input.mp4 --gpu             # NVENC HEVC encoding
-    python run_fps_interpolate.py -i input.mp4 --gpu-lossless    # NVENC AV1 lossless 444 10-bit
-"""
+    python run_fps_interpolate.py -i input.mp4 --gpu-lossless    # NVENC AV1 lossless 444 10-bit    python run_fps_interpolate.py -i input.mp4 --cpu-hevc --cq 20  # libx265 compatible
+    python run_fps_interpolate.py -i input.mp4 --dar correct     # resize to square pixels"""
 
 import argparse
 import os
@@ -35,7 +35,21 @@ def get_framerate(input_path: str) -> tuple[int, int]:
         return rate.numerator, rate.denominator
 
 
-def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args):
+def get_sar(input_path: str) -> tuple[int, int]:
+    """Get sample aspect ratio (SAR) from input video as (num, den).
+
+    Returns (1, 1) for square pixels or if SAR is not set.
+    """
+    with av.open(input_path) as container:
+        stream = container.streams.video[0]
+        sar = stream.sample_aspect_ratio
+        if sar is None or sar == 0:
+            return 1, 1
+        return sar.numerator, sar.denominator
+
+
+def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args,
+                     sar_num=1, sar_den=1):
     """Build the ffmpeg command based on encoding mode."""
     cmd = [
         "ffmpeg", "-hide_banner", "-stats",
@@ -70,6 +84,15 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args):
                 "-pix_fmt", "yuv444p10le",
             ]
             print(f"Encoding: {encoder} (GPU), QP={args.cq}")
+    elif args.cpu_hevc:
+        cmd += [
+            "-c:v", "libx265",
+            "-preset", args.x265_preset,
+            "-crf", str(args.cq),
+            "-pix_fmt", "yuv420p10le",
+        ]
+        print(f"Encoding: libx265 (CPU), preset={args.x265_preset}, "
+              f"CRF={args.cq}, 420 10-bit")
     else:
         cmd += [
             "-c:v", "ffv1", "-level", "3", "-slicecrc", "1",
@@ -77,6 +100,11 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args):
             "-pix_fmt", "yuv444p10le",
         ]
         print("Encoding: FFV1 lossless (CPU, 12 slices/threads)")
+
+    # For --dar copy, embed SAR metadata so players display correct aspect ratio
+    if args.dar == "copy" and (sar_num != 1 or sar_den != 1):
+        cmd += ["-vf", f"setsar={sar_num}/{sar_den}"]
+        print(f"DAR:       copy SAR {sar_num}:{sar_den} to output")
 
     cmd += ["-c:a", "copy", "-shortest", output_path, "-y"]
     return cmd
@@ -100,13 +128,24 @@ def parse_args():
                         help="Use custom NVENC GPU encoding instead of gpu-lossless or FFV1 CPU.\n"
                         "Cannot be used with --gpu-lossless; if both are set, --gpu-lossless\n"
                         "takes precedence.")
+    parser.add_argument("--cpu-hevc", action="store_true",
+                        help="CPU libx265 HEVC encoding (420 10-bit, compatible)")
+    parser.add_argument("--x265-preset", default="medium",
+                        choices=["ultrafast", "superfast", "veryfast", "faster",
+                                 "fast", "medium", "slow", "slower", "veryslow"],
+                        help="libx265 preset (default: medium)")
     parser.add_argument("--encoder", default="hevc_nvenc",
                         choices=["hevc_nvenc", "av1_nvenc"],
                         help="NVENC encoder to use with --gpu (default: hevc_nvenc).\n"
                         "Requires --gpu and is ignored if --gpu-lossless is set.")
     parser.add_argument("--cq", type=int, default=18,
-                        help="Constant QP for NVENC (lower=better, default: 18).\n"
-                        "Requires --gpu and is ignored if --gpu-lossless is set.")
+                        help="Quality value: CRF for --cpu-hevc, QP for --gpu (default: 18)")
+    parser.add_argument("--dar", default="none",
+                        choices=["none", "copy", "correct"],
+                        help="Display aspect ratio handling (default: none).\n"
+                        "  none:    ignore source DAR\n"
+                        "  copy:    copy source SAR metadata to output\n"
+                        "  correct: resize to square pixels")
     return parser.parse_args()
 
 
@@ -131,12 +170,16 @@ def main():
 
     # Detect framerate and compute output rate
     fps_num, fps_den = get_framerate(input_path)
+    sar_num, sar_den = get_sar(input_path)
+    sar_is_nonsquare = (sar_num != sar_den)
+    sar_str = f" SAR {sar_num}:{sar_den}" if sar_is_nonsquare else ""
+
     src_fps = fps_num / fps_den
     out_fps_num = fps_num * args.factor
     out_fps = out_fps_num / fps_den
     fps_str = f"{out_fps_num}/{fps_den}"
 
-    print(f"Input:      {input_path}")
+    print(f"Input:      {input_path}{sar_str}")
     print(f"Output:     {output_path}")
     print(f"Source FPS: {fps_num}/{fps_den} ({src_fps:.4f})")
     print(f"Output FPS: {fps_str} ({out_fps:.4f}) [{args.factor}x]")
@@ -151,26 +194,27 @@ def main():
     vspipe_proc = None
 
     def cleanup(signum=None, frame=None):
-        """Stop subprocesses and remove FIFO on exit.
-
-        Kills vspipe first to stop frame production, then sends SIGINT
-        to ffmpeg so it finalizes the container (writes MKV trailer)
-        and produces a playable partial output file.
-        """
+        """Stop subprocesses and remove FIFO on exit."""
+        # Kill vspipe first (stop producing frames) then let ffmpeg finalize
         if vspipe_proc and vspipe_proc.poll() is None:
             print(f"\nKilling vspipe (pid {vspipe_proc.pid})...")
             vspipe_proc.kill()
-            vspipe_proc.wait()
-
+            try:
+                vspipe_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         if ffmpeg_proc and ffmpeg_proc.poll() is None:
             print(f"Stopping ffmpeg (pid {ffmpeg_proc.pid}), finalizing output...")
-            ffmpeg_proc.send_signal(signal.SIGINT)
             try:
-                ffmpeg_proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
+                ffmpeg_proc.send_signal(signal.SIGINT)
+                ffmpeg_proc.wait(timeout=10)
+            except (subprocess.TimeoutExpired, OSError):
+                print(f"Force-killing ffmpeg (pid {ffmpeg_proc.pid})...")
                 ffmpeg_proc.kill()
-                ffmpeg_proc.wait()
-
+                try:
+                    ffmpeg_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         try:
             os.unlink(fifo_path)
         except FileNotFoundError:
@@ -186,15 +230,26 @@ def main():
     env["VRT_INPUT"] = input_path
     env["VRT_FACTOR"] = str(args.factor)
 
+    # Pass DAR correction info to .vpy for --dar correct
+    if args.dar == "correct" and sar_is_nonsquare:
+        env["VRT_DAR_CORRECT"] = "1"
+        env["VRT_SAR_NUM"] = str(sar_num)
+        env["VRT_SAR_DEN"] = str(sar_den)
+
     try:
-        ffmpeg_cmd = build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args)
-        ffmpeg_proc = subprocess.Popen(ffmpeg_cmd)
+        ffmpeg_cmd = build_ffmpeg_cmd(
+            fifo_path, input_path, output_path, fps_str, args,
+            sar_num=sar_num, sar_den=sar_den
+        )
+        # start_new_session=True puts children in their own process group
+        # so terminal Ctrl+C only goes to Python, giving us full cleanup control
+        ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, start_new_session=True)
 
         vspipe_proc = subprocess.Popen([
             "vspipe", "-c", "y4m", "-p",
             VPY_SCRIPT, fifo_path,
             "-r", str(args.cframes),
-        ], env=env)
+        ], env=env, start_new_session=True)
 
         vspipe_proc.wait()
         vspipe_exit = vspipe_proc.returncode
