@@ -10,6 +10,7 @@ Usage:
     python run_motion_deblur.py -i input.mp4 --gpu             # NVENC HEVC encoding
     python run_motion_deblur.py -i input.mp4 --gpu --encoder hevc_nvenc --cq 18
     python run_motion_deblur.py -i input.mp4 --gpu-lossless    # NVENC lossless 444 10-bit
+    python run_motion_deblur.py -i input.mp4 --upscale esrgan --esrgan-model weights.pth
 """
 
 import argparse
@@ -105,11 +106,22 @@ def parse_args():
     parser.add_argument("--cq", type=int, default=18,
                         help="Constant QP for NVENC (lower=better, default: 18).\n"
                         "Requires --gpu and is ignored if --gpu-lossless is set.")
+
+    # Upscaling options
+    up_group = parser.add_argument_group("Upscaling")
+    up_group.add_argument("--upscale", choices=["none", "esrgan"], default="none",
+                          help="Upscale after deblurring (default: none)")
+    up_group.add_argument("--esrgan-model", default="",
+                          help="Path to ESRGAN .pth model (required for --upscale esrgan)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # Validate upscale options
+    if args.upscale == "esrgan" and not args.esrgan_model:
+        sys.exit("ERROR: --esrgan-model is required when --upscale esrgan is used")
 
     script_dir = Path(__file__).resolve().parent
 
@@ -177,6 +189,12 @@ def main():
     # Pass input file to .vpy via environment variable
     env = os.environ.copy()
     env["VRT_INPUT"] = input_path
+    env["VRT_UPSCALE"] = args.upscale
+    if args.esrgan_model:
+        esrgan_model_path = str(Path(args.esrgan_model).resolve())
+        if not Path(esrgan_model_path).is_file():
+            sys.exit(f"ERROR: ESRGAN model not found: {esrgan_model_path}")
+        env["VRT_ESRGAN_MODEL"] = esrgan_model_path
 
     try:
         ffmpeg_cmd = build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args)

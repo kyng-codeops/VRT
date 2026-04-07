@@ -10,6 +10,9 @@ input_file = os.environ.get("VRT_INPUT")
 if not input_file:
     raise vs.Error("VRT_INPUT environment variable not set. Use run_motion_deblur.py to run this script.")
 
+upscale_mode = os.environ.get("VRT_UPSCALE", "none")  # none | esrgan
+esrgan_model = os.environ.get("VRT_ESRGAN_MODEL", "")
+
 # Load your source
 clip = core.ffms2.Source(input_file)
 
@@ -62,6 +65,127 @@ mask = core.resize.Point(motion, format=vs.GRAYS)
 
 # Blend: deblurred where motion is high, original where static
 result = core.std.MaskedMerge(clip, deblurred, mask)
+
+# ---------------------------------------------------------------------------
+# Optional ESRGAN upscaling (after deblur)
+# ---------------------------------------------------------------------------
+if upscale_mode == "esrgan":
+    # Real-ESRGAN super-resolution via custom .pth weights
+    # Uses chunk-based processing with caching to avoid VS deadlocks.
+    import torch
+    import numpy as np
+
+    if not esrgan_model or not os.path.isfile(esrgan_model):
+        raise vs.Error(f"VRT_ESRGAN_MODEL not set or file not found: {esrgan_model}")
+
+    def load_esrgan_model(model_path, device):
+        \"\"\"Load a Real-ESRGAN .pth state dict and infer architecture.\"\"\"
+        state_dict = torch.load(model_path, map_location=device, weights_only=False)
+        if "params_ema" in state_dict:
+            state_dict = state_dict["params_ema"]
+        elif "params" in state_dict:
+            state_dict = state_dict["params"]
+
+        from models.network_rrdbnet import RRDBNet
+
+        body_keys = [k for k in state_dict if k.startswith("body.") and ".rdb" in k]
+        if body_keys:
+            block_nums = set(int(k.split(".")[1]) for k in body_keys)
+            num_block = max(block_nums) + 1
+        else:
+            num_block = 23
+
+        conv_first_ch = state_dict["conv_first.weight"].shape[1]
+        out_nc = state_dict["conv_last.weight"].shape[0]
+        num_feat = state_dict["conv_first.weight"].shape[0]
+
+        if conv_first_ch == out_nc * 4:
+            scale = 2
+            in_nc = out_nc
+        elif conv_first_ch == out_nc * 16:
+            scale = 1
+            in_nc = out_nc
+        else:
+            scale = 4
+            in_nc = conv_first_ch
+
+        model = RRDBNet(in_nc, out_nc, num_feat=num_feat,
+                        num_block=num_block, num_grow_ch=32,
+                        scale=scale)
+        model.load_state_dict(state_dict, strict=True)
+        model.eval().to(device)
+        return model, scale, out_nc
+
+    # Result is still RGBS from deblur, use directly
+    clip_rgb = result
+
+    # Load model eagerly
+    _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _model, sr_scale, _out_nc = load_esrgan_model(esrgan_model, _device)
+    _num_input_frames = _out_nc // 3
+
+    out_w = clip_rgb.width * sr_scale
+    out_h = clip_rgb.height * sr_scale
+    total_frames = clip_rgb.num_frames
+
+    # Chunk-based caching (like vsrvrt preview_mode)
+    _chunk_size = 64
+    _chunk_cache = {}
+    _max_cached_chunks = 3
+
+    def _process_chunk(chunk_idx):
+        \"\"\"Process all frames in a chunk and cache results.\"\"\"
+        start = chunk_idx * _chunk_size
+        end = min(start + _chunk_size, total_frames)
+        nf = _num_input_frames
+        half = nf // 2 if nf > 1 else 0
+
+        results = []
+        for n in range(start, end):
+            if nf > 1:
+                frames_rgb = []
+                for offset in range(-half, -half + nf):
+                    idx = min(max(n + offset, 0), total_frames - 1)
+                    fr = clip_rgb.get_frame(idx)
+                    planes = [np.asarray(fr[p]).copy() for p in range(3)]
+                    frames_rgb.append(np.stack(planes, axis=0))
+                img = np.concatenate(frames_rgb, axis=0)
+            else:
+                fr = clip_rgb.get_frame(n)
+                planes = [np.asarray(fr[p]).copy() for p in range(3)]
+                img = np.stack(planes, axis=0)
+
+            tensor = torch.from_numpy(img).unsqueeze(0).to(_device)
+            with torch.no_grad():
+                output = _model(tensor)
+            output_np = output.squeeze(0).clamp(0, 1).cpu().numpy()
+            results.append(output_np)
+            del tensor
+
+        torch.cuda.empty_cache()
+        return results
+
+    blank = core.std.BlankClip(clip_rgb, width=out_w, height=out_h)
+
+    def esrgan_process(n, f):
+        \"\"\"Serve frame from chunk cache; process chunk if not cached.\"\"\"
+        chunk_idx = n // _chunk_size
+
+        if chunk_idx not in _chunk_cache:
+            _chunk_cache[chunk_idx] = _process_chunk(chunk_idx)
+            if len(_chunk_cache) > _max_cached_chunks:
+                oldest = min(k for k in _chunk_cache if k != chunk_idx)
+                del _chunk_cache[oldest]
+
+        frame_in_chunk = n - (chunk_idx * _chunk_size)
+        output_np = _chunk_cache[chunk_idx][frame_in_chunk]
+
+        out_frame = f.copy()
+        for p in range(3):
+            np.copyto(np.asarray(out_frame[p]), output_np[p])
+        return out_frame
+
+    result = core.std.ModifyFrame(blank, clips=[blank], selector=esrgan_process)
 
 # Convert back to YUV for y4m output (444 to match FFV1 lossless output)
 result = core.resize.Bicubic(result, format=vs.YUV444P10, matrix_s="470bg")
