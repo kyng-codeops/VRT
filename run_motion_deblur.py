@@ -9,7 +9,7 @@ Usage:
     python run_motion_deblur.py -i input.mp4 -o out.mkv       # custom output name
     python run_motion_deblur.py -i input.mp4 --gpu             # NVENC HEVC encoding
     python run_motion_deblur.py -i input.mp4 --gpu --encoder hevc_nvenc --cq 18
-    python run_motion_deblur.py -i input.mp4 --gpu-lossless    # NVENC lossless 444 10-bit
+    python run_motion_deblur.py -i input.mp4 --gpu-lossless    # NVENC H.264 lossless 444 8-bit
     python run_motion_deblur.py -i input.mp4 --cpu-hevc --cq 20 --x265-preset slow
     python run_motion_deblur.py -i input.mp4 --upscale esrgan --esrgan-model weights.pth
 """
@@ -70,17 +70,13 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args,
 
     if args.gpu or args.gpu_lossless:
         if args.gpu_lossless:
-            # AV1 NVENC for true lossless 444 10-bit
             cmd += [
-                "-c:v", "av1_nvenc",
+                "-c:v", "h264_nvenc",
                 "-preset", "p1",
                 "-tune", "lossless",
-                "-rc", "constqp",
-                "-qp", "0",
-                "-b:v", "0",
-                "-pix_fmt", "yuv444p10le",
+                "-pix_fmt", "yuv444p",
             ]
-            print("Encoding: av1_nvenc (GPU), lossless 444 10-bit")
+            print("Encoding: h264_nvenc (GPU), lossless 444 8-bit")
         else:
             encoder = args.encoder
             cmd += [
@@ -90,9 +86,9 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps, args,
                 "-rc", "constqp",
                 "-qp", str(args.cq),
                 "-b:v", "0",
-                "-pix_fmt", "yuv444p10le",
+                "-pix_fmt", "yuv420p10le",
             ]
-            print(f"Encoding: {encoder} (GPU), QP={args.cq}")
+            print(f"Encoding: {encoder} (GPU), QP={args.cq}, 420 10-bit")
     elif args.cpu_hevc:
         cmd += [
             "-c:v", "libx265",
