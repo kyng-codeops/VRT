@@ -56,7 +56,7 @@ def build_ffmpeg_cmd(fifo_path, input_path, output_path, fps_str, args,
         "ffmpeg", "-hide_banner", "-stats",
         "-f", "yuv4mpegpipe", "-i", fifo_path,
         "-i", input_path,
-        "-map", "0:v", "-map", "1:a", "-map_metadata", "1",
+        "-map", "0:v", "-map", "1:a?", "-map_metadata", "1",
         "-r", fps_str,
     ]
 
